@@ -1,0 +1,502 @@
+// @vitest-environment jsdom
+/**
+ * WorkBuddyCard integration tests — the WIRING layer AccountPool's own tests
+ * cannot reach.
+ *
+ * `tests/pool-render.spec.tsx` mounts `AccountPool` directly and pins the
+ * three-state `onSaved` CONTRACT. But the card is what IMPLEMENTS that
+ * contract, and the implementations that the round-4 verifier found had no
+ * behavioural coverage live here:
+ *
+ *   POLARITY  `refreshUsage`'s latest-wins probe reports STALE. Writing
+ *        `if (!fresh()) return undefined` inverts it, so every response that
+ *        is NOT superseded — i.e. every response when only one fetch is in
+ *        flight — is discarded and the card renders its placeholder forever.
+ *        This SHIPPED once, and the source-text guard in
+ *        `tests/pool-e2e.spec.ts` enforced the inverted spelling. The rendered
+ *        assertion below is what makes the polarity un-regressable.
+ *   M15  `refreshUsage`'s catch returns `{}` instead of `undefined`, so a
+ *        FAILED re-read resolves truthy and the pool section discards the
+ *        draft against a stale prop — the exact A-8/N1 defect, restored.
+ *   M18  `onRefresh={() => {}}` — the pool goes stale after every batch.
+ *   M19  `const fresh = () => usageGuard.current.begin(region)()` — a wrapper
+ *        that re-claims a generation on every call, so the probe is always
+ *        superseded and the card applies NO usage at all, ever.
+ *
+ * Each test names the mutant it kills. A survivor here is a user-visible
+ * defect, not a guard gap.
+ */
+import { readFileSync } from 'node:fs'
+import { dirname, join } from 'node:path'
+import { fileURLToPath } from 'node:url'
+import { afterEach, describe, expect, it, vi } from 'vitest'
+import { WorkBuddyCard } from '../src/client/WorkBuddyCard.tsx'
+import { fakeScope, mount, stubFetch, t } from './pool-render-helpers.tsx'
+
+afterEach(() => { vi.unstubAllGlobals() })
+
+const USAGE_PATH = '/plugins/dsh-connect-workbuddy/usage'
+
+/** A signed-in usage body with an account pool the card will render. */
+function usageOf(overrides: Record<string, unknown> = {}): Record<string, unknown> {
+  return {
+    status: 'signed-in',
+    accountId: 'real-1',
+    accountName: 'Real One',
+    region: 'cn',
+    tokenExpiresAtMs: Date.now() + 86_400_000,
+    selectionExplicit: true,
+    accounts: [{ accountId: 'real-1', accountName: 'Real One' }],
+    models: [{ id: 'free-1', name: 'Free One', creditMultiplier: 0 }],
+    enabledModelIds: ['free-1'],
+    imageModelIds: [],
+    credits: {
+      total: 20,
+      expiringSoon: 0,
+      packages: [{
+        packageName: 'Monthly', remain: 12.5, size: 20, monthly: true,
+      }],
+    },
+    pool: {
+      enabled: true,
+      checkinSupported: true,
+      targetModelSource: 'free',
+      targetModelId: 'free-1',
+      staleTargetModelId: '',
+      memberAccountIds: ['real-1'],
+      effectiveMemberAccountIds: ['real-1'],
+      accounts: [{
+        accountId: 'real-1', accountName: 'Real One', current: true, member: true, checkedInToday: true,
+      }],
+      catalog: [{ id: 'free-1', name: 'Free One', creditMultiplier: 0 }],
+    },
+    ...overrides,
+  }
+}
+
+interface FetchCall { url: string, init: any }
+
+/**
+ * A fetch stub with per-route answers, recording the order of calls so a test
+ * can count usage re-reads without depending on the response payloads.
+ *
+ * Patterns are matched IN ORDER and are plain substrings; `'*'` is the
+ * catch-all and must be listed LAST. It is NOT a glob — `includes('*')` is
+ * false for every real URL, so a routes table whose only entry is `'*'` would
+ * silently answer `{}` for everything and hand the card an empty usage body
+ * (which throws on `status.accounts.length`, not on the assertion under test).
+ */
+function routeFetch(
+  routes: Array<[string, () => { status?: number, body: unknown }]>,
+): FetchCall[] {
+  // Built on the SHARED stub rather than hand-rolling a second response shape:
+  // this file's private version answered without `headers`, so the moment the
+  // card started reading `content-type` to pick its parser every test here threw
+  // inside the batch's catch and silently reported a failed batch. One double,
+  // one shape, no drift.
+  return stubFetch(url => {
+    const route = routes.find(([pattern]) => pattern === '*' || url.includes(pattern))
+    return route === undefined ? { body: {} } : route[1]()
+  }) as FetchCall[]
+}
+
+const usageCalls = (calls: FetchCall[]): FetchCall[] => calls.filter(call => call.url.startsWith(USAGE_PATH))
+const poolCalls = (calls: FetchCall[]): FetchCall[] => calls.filter(call => call.url.includes('/pool'))
+
+describe('the card renders what it fetched (polarity)', () => {
+  it('applies a NON-superseded usage snapshot — the guard must not discard it', async () => {
+    // The regression this pins: `begin()` reports STALE (see `createLatestWins`
+    // in `src/account-pool.ts`; `tests/account-pool.spec.ts` asserts
+    // `first()` is `true` only after a NEWER call begins). Writing
+    // `if (!fresh()) return undefined` against that probe bails out on the
+    // FIRST, un-superseded, perfectly-good response, so no snapshot is ever
+    // applied. Nothing else in the suite catches it: the source guard counted
+    // the guard occurrences and pinned the inverted spelling verbatim.
+    const calls = routeFetch([['*', () => ({ body: usageOf() })]])
+    const m = await mount(WorkBuddyCard, { t, settingsScope: fakeScope({}), view: 'page' })
+    await m.settle()
+    // The fetch DID happen — so a blank card cannot be blamed on the stub.
+    expect(usageCalls(calls).length).toBeGreaterThanOrEqual(2)
+    // The signed-in BODY renders only from an APPLIED snapshot. The model section
+    // is the marker: it lives inside the signed-in branch and always renders there,
+    // so a dropped or superseded snapshot leaves it out. (The marker has moved twice
+    // as this card shed single-account-era chrome — first the status line, then the
+    // credits panel — which is exactly why it is now a structural element rather
+    // than a piece of copy.)
+    expect(m.text()).toContain('row.modelsTitle')
+    expect(m.text()).not.toContain('row.signedOut')
+    expect(m.text()).not.toContain('row.requestFailed')
+    await m.unmount()
+  })
+
+  it('does not depend on which of the two region fetches resolves last', async () => {
+    // Both regions are fetched on open. A guard keyed globally (or re-claimed
+    // per call) would make one region cancel the other and leave a tab blank.
+    // The CN answer is deliberately the SLOW one, so it settles last; a
+    // "last response wins" rule would still have to apply it.
+    const settled: string[] = []
+    const calls = routeFetch([
+      ['region=cn', () => ({ body: usageOf() })],
+      ['region=global', () => ({ body: usageOf({ accountName: 'Global One' }) })],
+      ['*', () => ({ body: {} })],
+    ])
+    const m = await mount(WorkBuddyCard, { t, settingsScope: fakeScope({}), view: 'page' })
+    await m.settle()
+    for (const call of calls) settled.push(call.url)
+    expect(settled.length).toBeGreaterThanOrEqual(2)
+    expect(m.text()).toContain('row.modelsTitle')
+    expect(m.text()).toContain('Real One')
+    await m.unmount()
+  })
+})
+
+describe('the card implements the pool contract it hands down (M15, M18, M19)', () => {
+  it('applies the usage snapshot it fetched (M19: a wrapper around the guard drops every answer)', async () => {
+    // The card fetches BOTH regions on open (that is the fix for the tab-dot
+    // staleness). With M19 the guard's closure is re-claimed, the probe is
+    // always superseded, and NEITHER region's snapshot is ever applied: the
+    // card renders as if no usage had arrived at all.
+    const calls = routeFetch([['*', () => ({ body: usageOf() })]])
+    const m = await mount(WorkBuddyCard, { t, settingsScope: fakeScope({}), view: 'page' })
+    await m.settle()
+    expect(usageCalls(calls).length).toBeGreaterThanOrEqual(2)
+    expect(m.text()).toContain('row.modelsTitle')
+    expect(m.text()).toContain('Real One')
+    expect(m.text()).not.toContain('row.requestFailed')
+    await m.unmount()
+  })
+
+  it('does NOT discard the pool draft when the usage re-read FAILS (M15)', async () => {
+    // Open with a healthy usage, then make the NEXT usage read fail — exactly
+    // what happens when the user saves while the Host is unreachable.
+    let usageOk = true
+    const calls = routeFetch([
+      [USAGE_PATH, () => (usageOk ? { body: usageOf() } : { status: 500, body: { error: 'boom' } })],
+      ['*', () => ({ body: {} })],
+    ])
+    const m = await mount(WorkBuddyCard, { t, settingsScope: fakeScope({}), view: 'page' })
+    await m.settle()
+    expect(calls.length).toBeGreaterThan(0)
+    expect(m.text()).toContain('row.modelsTitle')
+    // Edit the pool membership so the draft is dirty.
+    const box = m.container.querySelector<HTMLInputElement>('.dsm-workbuddy-pool-table input[type=checkbox]')
+    if (box === null) throw new Error('no pool member checkbox rendered')
+    await m.click(box)
+    expect(m.container.querySelector('.dsm-workbuddy-pool-save-buttons button:last-child')?.hasAttribute('disabled'), 'the edit is still pending — Save must be enabled').toBe(false)
+    // The save writes through the Host endpoint (stubbed to succeed) but the
+    // re-read then fails: `refreshUsage` resolves `undefined` → `onSaved`
+    // answers false → the section must KEEP the draft. With M15 the catch
+    // returns `{}`, `onSaved` answers true, and the draft is discarded.
+    usageOk = false
+    await m.click(m.button('row.poolSaved'))
+    await m.settle()
+    expect(m.container.querySelector('.dsm-workbuddy-pool-save-buttons button:last-child')?.hasAttribute('disabled'), 'the edit is still pending — Save must be enabled').toBe(false)
+    expect(m.text()).toContain('row.poolSaveFailed|message=row.poolSavedStaleRefresh')
+    // A failed re-read must NOT blank the panel. The region keeps its last good
+    // snapshot with a `refreshError` overlay, so the pool section the user was
+    // editing is still there. Before the merge fix the catch replaced the whole
+    // region with `{ status: 'error' }` — a variant carrying no `accounts`,
+    // `pool`, `credits` or `models` — and the entire body (which is gated on
+    // `status === 'signed-in'`) disappeared, pool draft included.
+    expect(m.text()).toContain('row.poolTitle')
+    expect(m.text()).toContain('row.modelsTitle')
+    expect(m.text()).toContain('row.requestFailedHint|message=HTTP 500')
+    await m.unmount()
+  })
+
+  it('re-reads the usage after a successful batch (M18: onRefresh is not a no-op)', async () => {
+    let batches = 0
+    const calls = routeFetch([
+      [USAGE_PATH, () => ({ body: usageOf() })],
+      ['/pool', () => {
+        batches += 1
+        return {
+          body: {
+            action: 'checkin',
+            rows: [{ accountId: 'real-1', accountName: 'Real One', status: 'claimed' }],
+          },
+        }
+      }],
+      ['*', () => ({ body: {} })],
+    ])
+    const m = await mount(WorkBuddyCard, { t, settingsScope: fakeScope({}), view: 'page' })
+    await m.settle()
+    const before = usageCalls(calls).length
+    await m.click(m.button('row.poolCheckinAll'))
+    await m.settle()
+    expect(batches).toBe(1)
+    // The batch must trigger a usage re-read so the panel reflects the new
+    // check-in state. With M18 (`onRefresh={() => {}}`) the count is unchanged.
+    expect(usageCalls(calls).length).toBeGreaterThan(before)
+    await m.unmount()
+  })
+})
+
+describe('the model list no longer folds', () => {
+  const headOf = (m: { container: HTMLElement }): HTMLElement => {
+    const found = m.container.querySelector('.dsm-workbuddy-models-head')
+    if (found === null) throw new Error('no model section header rendered')
+    return found as HTMLElement
+  }
+  const modelCheckbox = (m: { container: HTMLElement }): HTMLInputElement => {
+    const found = m.container.querySelector<HTMLInputElement>('.dsm-workbuddy-model-enabled input[type=checkbox]')
+    if (found === null) throw new Error('no model checkbox rendered')
+    return found
+  }
+  const openCard = async (): Promise<Awaited<ReturnType<typeof mount>>> => {
+    routeFetch([['*', () => ({ body: usageOf() })]])
+    const m = await mount(WorkBuddyCard, { t, settingsScope: fakeScope({}), view: 'page' })
+    await m.settle()
+    return m
+  }
+
+  it('renders no disclosure at all — the list is simply always there', async () => {
+    // It used to be a native <details>: clickable header, chevron, "click to
+    // collapse" hint. The list is what users came for, so folding it only ever
+    // hid the thing they wanted — and it made this the card's only
+    // click-to-hide section, which reads as a different kind of section.
+    const m = await openCard()
+    expect(m.container.querySelector('details.dsm-workbuddy-models-fold')).toBeNull()
+    // Scoped to the MODEL section on purpose. This used to assert that the whole
+    // card contained no <summary> at all, which was only ever true because the
+    // models fold was its sole disclosure. The pool's account table has since
+    // gained an unrelated one (the ordering-rule section), and a card-wide
+    // "no summary anywhere" would now fail for a reason that has nothing to do
+    // with this section. The guarantee that matters is: the model list, in its
+    // own section, does not fold.
+    expect(m.container.querySelector('.dsm-workbuddy-models summary')).toBeNull()
+    expect(m.container.querySelector('.dsm-workbuddy-models details')).toBeNull()
+    expect(m.container.querySelector('.dsm-workbuddy-models-chevron')).toBeNull()
+    expect(m.container.querySelector('.dsm-workbuddy-models-fold-hint')).toBeNull()
+    // The header and the list are both still rendered, and the header still says
+    // what the section holds.
+    expect(headOf(m).textContent).toContain('row.modelsTitle')
+    expect(headOf(m).textContent).toContain('row.modelsSummary|count=1')
+    expect(m.container.querySelectorAll('.dsm-workbuddy-model').length).toBeGreaterThan(0)
+    // A click on the header must NOT hide anything any more.
+    await m.click(headOf(m))
+    expect(m.container.querySelectorAll('.dsm-workbuddy-model').length).toBeGreaterThan(0)
+    await m.unmount()
+  })
+
+  it('still says so in the header when there are unsaved edits', async () => {
+    // Kept from the fold era, and it matters MORE now: with no fold there is no
+    // way to hide the pending edit, but the header marker is still what tells a
+    // reader — without scrolling a long model list to the buttons — that
+    // something is unsaved. The "looks settled, is not" shape this card avoids.
+    const m = await openCard()
+    expect(headOf(m).textContent).not.toContain('row.modelsDirty')
+    await m.click(modelCheckbox(m))
+    expect(headOf(m).textContent).toContain('row.modelsDirty')
+    await m.unmount()
+  })
+})
+
+describe('the account picker is gone, and the status line agrees with the pool', () => {
+  it('renders no account dropdown at all', async () => {
+    // Accounts are managed in the POOL now: its member checkboxes are the
+    // selection surface, and with the pool on the ranking decides who serves —
+    // so a dropdown that changes nothing yet looks authoritative is worse than
+    // no dropdown. It also removed a real contradiction: the header could name
+    // one account while the picker showed another.
+    routeFetch([[USAGE_PATH, () => ({ body: usageOf() })], ['*', () => ({ body: {} })]])
+    const m = await mount(WorkBuddyCard, { t, settingsScope: fakeScope({}), view: 'page' })
+    await m.settle()
+    expect(m.container.querySelector('.dsm-workbuddy-account-picker')).toBeNull()
+    expect(m.container.querySelector('.dsm-workbuddy-usage-select')).toBeNull()
+    await m.unmount()
+  })
+
+  it('renders no signed-in status card at all', async () => {
+    // The card used to lead with a boxed "Signed in: A / token expires …".
+    // Both halves are gone, for different reasons: naming ONE account is the
+    // wrong claim once several can be signed in (the pool block names the one
+    // serving, and its table lists them all), and a token that auto-renews has
+    // an expiry the user cannot act on. What remains for a broken region is only
+    // text with a remedy — covered by the credential/credits panels, and by the
+    // per-region dot on the tabs.
+    //
+    // Pinned as "absent" rather than deleted from the test file: re-introducing a
+    // status card is a UI decision, and it should take a deliberate edit to the
+    // expectation, not slip through as a new element nobody asserted.
+    routeFetch([[USAGE_PATH, () => ({ body: usageOf() })], ['*', () => ({ body: {} })]])
+    const m = await mount(WorkBuddyCard, { t, settingsScope: fakeScope({}), view: 'page' })
+    await m.settle()
+    expect(m.container.querySelector('.dsm-workbuddy-usage-account')).toBeNull()
+    expect(m.container.querySelector('.dsm-workbuddy-usage-status')).toBeNull()
+    expect(m.text()).not.toContain('row.tokenExpiry')
+    // And the card is still rendering the signed-in body — otherwise "absent"
+    // would pass on an empty card.
+    expect(m.text()).toContain('row.modelsTitle')
+    await m.unmount()
+  })
+
+  it('offers re-detection in the pool AND while signed out', async () => {
+    // The control moved into the pool block, which renders for a signed-in region
+    // only — so the signed-out branch needs its own copy. Without it, "I signed in
+    // over in the app, look again" (precisely a signed-out action) would have no
+    // way to run.
+    routeFetch([[USAGE_PATH, () => ({ body: usageOf() })], ['*', () => ({ body: {} })]])
+    const signedIn = await mount(WorkBuddyCard, { t, settingsScope: fakeScope({}), view: 'page' })
+    await signedIn.settle()
+    expect(signedIn.text()).toContain('row.accountsRescan')
+    await signedIn.unmount()
+
+    routeFetch([[
+      USAGE_PATH,
+      () => ({ body: { status: 'signed-out', accounts: [], selectionExplicit: false, searched: [] } }),
+    ], ['*', () => ({ body: {} })]])
+    const signedOut = await mount(WorkBuddyCard, { t, settingsScope: fakeScope({}), view: 'page' })
+    await signedOut.settle()
+    expect(signedOut.text()).toContain('row.accountsRescan')
+    await signedOut.unmount()
+  })
+})
+
+describe('the model list comes last', () => {
+  it('renders the pool before the model section', async () => {
+    // The requested order: status → credits → pool → models. "Setting the models
+    // last" is the point — the pool is what you reach for daily, and it should not
+    // sit below a long, foldable list.
+    routeFetch([[USAGE_PATH, () => ({ body: usageOf() }), ], ['*', () => ({ body: {} })]])
+    const m = await mount(WorkBuddyCard, { t, settingsScope: fakeScope({}), view: 'page' })
+    await m.settle()
+    const html = m.html()
+    // Match the SECTION's class attribute, not a bare prefix: `dsm-workbuddy-models`
+    // also prefixes the tab hint (`dsm-workbuddy-models-summary`) that sits above
+    // everything, so a substring search would compare against the wrong element
+    // and pass whatever the order was.
+    const pool = html.indexOf('class="dsm-workbuddy-pool"')
+    const models = html.indexOf('class="dsm-workbuddy-models"')
+    expect(pool, 'no pool section rendered').toBeGreaterThan(-1)
+    expect(models, 'no model section rendered').toBeGreaterThan(-1)
+    expect(pool, 'the model list is not last').toBeLessThan(models)
+    await m.unmount()
+  })
+})
+
+describe('the two commit rows now look alike', () => {
+  it('renders the encouragement link in BOTH the pool row and the model row', async () => {
+    // The request was to make the pool row match the model row. Asserting the star
+    // link exists in both, from the CARD (not the isolated section), catches the
+    // case where the two rows drift apart again.
+    routeFetch([[USAGE_PATH, () => ({ body: usageOf() })], ['*', () => ({ body: {} })]])
+    const m = await mount(WorkBuddyCard, { t, settingsScope: fakeScope({}), view: 'page' })
+    await m.settle()
+    const poolBar = m.container.querySelector('.dsm-workbuddy-pool-save-bar')
+    const modelBar = m.container.querySelector('.dsm-workbuddy-model-actions')
+    expect(poolBar, 'no pool commit row').not.toBeNull()
+    expect(modelBar, 'no model commit row').not.toBeNull()
+    for (const [name, bar] of [['pool', poolBar], ['model', modelBar]] as const) {
+      const cheer = bar?.querySelector('a.dsm-workbuddy-usage-cheer')
+      expect(cheer, `the ${name} row lost its encouragement link`).not.toBeNull()
+      // And in both rows it is the FIRST child, i.e. on the left.
+      expect(bar?.firstElementChild?.className, `the ${name} row does not lead with it`)
+        .toContain('dsm-workbuddy-usage-cheer')
+    }
+    await m.unmount()
+  })
+
+  it('keeps the pool buttons in the LAST group, matching the model row', async () => {
+    routeFetch([[USAGE_PATH, () => ({ body: usageOf() })], ['*', () => ({ body: {} })]])
+    const m = await mount(WorkBuddyCard, { t, settingsScope: fakeScope({}), view: 'page' })
+    await m.settle()
+    const poolBar = m.container.querySelector('.dsm-workbuddy-pool-save-bar')
+    const modelBar = m.container.querySelector('.dsm-workbuddy-model-actions')
+    // Model row: buttons wrapper is last. Pool row must agree.
+    expect(modelBar?.lastElementChild?.className).toContain('dsm-workbuddy-model-actions-buttons')
+    expect(poolBar?.lastElementChild?.className).toContain('dsm-workbuddy-pool-save-buttons')
+    await m.unmount()
+  })
+})
+
+describe('the account-level error is actually rendered', () => {
+  it('shows what the Host said when the hides could not be cleared', async () => {
+    // `rescanAccounts` writes `accountError` for TWO reasons — a refused write
+    // and a rescan whose hides stayed put — and until this change nothing
+    // rendered it: the state was set on every failure path and displayed on
+    // none. The user's evidence was a button that appeared to work. This pins
+    // the rendering half against the card's own DOM, because the wiring half
+    // (the route flag) is asserted in `tests/web-status.spec.ts`.
+    routeFetch([
+      ['/accounts/refresh', () => ({ body: { accounts: [{ accountId: 'real-1' }], dismissalsCleared: false } })],
+      [USAGE_PATH, () => ({ body: usageOf() })],
+      ['*', () => ({ body: {} })],
+    ])
+    const m = await mount(WorkBuddyCard, { t, settingsScope: fakeScope({}), view: 'page' })
+    await m.settle()
+    // Before the rescan there is no error line.
+    expect(m.container.querySelector('.dsm-workbuddy-account-error')).toBeNull()
+    const rescan = m.buttons().find(button => (button.textContent ?? '').includes('row.accountsRescan'))
+    expect(rescan, 'no rescan button rendered').toBeDefined()
+    await m.click(rescan!)
+    await m.settle()
+    const error = m.container.querySelector('.dsm-workbuddy-account-error')
+    expect(error, 'the failed clear was not surfaced').not.toBeNull()
+    expect(error?.getAttribute('role')).toBe('alert')
+    expect(error?.textContent).toContain('row.rescanHidesKept')
+    await m.unmount()
+  })
+})
+
+/**
+ * The free-model quota warning.
+ *
+ * WHY THIS IS NOT COSMETIC. The catalog marks several models `creditMultiplier: 0`,
+ * and the card displays them as free. The upstream still refuses them with
+ * `6004` / `14003` once a per-window token quota is spent — that refusal is the
+ * quota, not a billing balance, and it cannot be topped up. A user who reads
+ * "free" as "unlimited" therefore interprets a 6004 as the plugin being broken
+ * and goes looking for a bad account (issue #56's reporter spent that hunt), or
+ * for a top-up that would change nothing.
+ *
+ * The line has to be its own BOLD paragraph. Folding it into the grey sentence
+ * above is exactly how the ×0 tiers came to read as unlimited in the first
+ * place, so the two properties pinned here are the ones that carry the meaning:
+ * it RENDERS at all, and it does not share the muted weight of its neighbours.
+ *
+ * The locale PROSE is asserted in the table check below rather than here, so a
+ * rewording does not have to touch this file.
+ */
+describe('the free-model quota warning', () => {
+  it('renders, and is bold rather than another muted hint line', async () => {
+    routeFetch([
+      [USAGE_PATH, () => ({ body: usageOf() })],
+      ['*', () => ({ body: {} })],
+    ])
+    const m = await mount(WorkBuddyCard, { t, settingsScope: fakeScope({}), view: 'page' })
+    await m.settle()
+
+    const warn = m.container.querySelector('.dsm-workbuddy-free-quota-warn')
+    expect(warn, 'the free-model quota warning is not rendered').not.toBeNull()
+    // `t` returns the KEY in these tests, so this proves WHICH string was chosen
+    // rather than what it says — the split that keeps prose and wiring from
+    // breaking each other.
+    expect(warn?.textContent).toContain('row.tabFreeQuotaWarn')
+
+    // The bold class is the whole signal. Asserting the class rather than a
+    // computed weight keeps this out of jsdom's (absent) cascade, and the CSS
+    // rule itself is pinned in `tests/card-credits-switch.spec.tsx`'s sibling
+    // source guard below.
+    expect(warn?.className).toContain('dsm-workbuddy-models-summary')
+    await m.unmount()
+  })
+
+  it('keeps the weight in the stylesheet rather than in an inline style', async () => {
+    // A `style={{fontWeight:600}}` would satisfy the render assertion above
+    // while making the rule unfindable to anyone auditing the card's CSS. The
+    // weight has to live where every other card rule lives.
+    //
+    // Read through `fileURLToPath` rather than `new URL(..., import.meta.url)`:
+    // under this file's jsdom environment `import.meta.url` is not a file URL,
+    // and handing it to `readFile` throws "The URL must be of scheme file" —
+    // a broken TEST, not a missing rule (it fails the same way against the
+    // correct stylesheet).
+    const css = readFileSync(
+      join(dirname(fileURLToPath(import.meta.url)), '..', 'src', 'client', 'styles.ts'),
+      'utf8',
+    )
+    expect(css, 'the bold rule is missing from the stylesheet')
+      .toContain('.dsm-workbuddy-free-quota-warn{font-weight:600}')
+  })
+})

@@ -1,0 +1,1756 @@
+import { describe, expect, it } from 'vitest'
+import { Context } from '@deepseek-ai/cordis'
+import { workBuddyAccountCredits, workBuddyWebStatus } from '../src/web-status.ts'
+import type { WorkBuddyStatusRouteOptions } from '../src/web-status.ts'
+import { readFileSync } from 'node:fs'
+import {
+  WORKBUDDY_ACCOUNTS_REFRESH_PATH,
+  WORKBUDDY_CHECKIN_PATH,
+  WORKBUDDY_MODELS_REFRESH_PATH,
+  WORKBUDDY_OAUTH_PATH,
+  WORKBUDDY_TRANSFER_PATH,
+  WORKBUDDY_USAGE_PATH,
+  oauthActionOf,
+  transferActionOf,
+  withWorkBuddyRouteAction,
+} from '../src/status-paths.ts'
+import { FALLBACK_WORKBUDDY_MODELS } from '../src/catalog.ts'
+import type { WorkBuddyCredential } from '../src/auth.ts'
+import { WorkBuddyCredentialRejectedError } from '../src/upstream.ts'
+import type { WorkBuddyRegion } from '../src/upstream.ts'
+
+const CREDENTIAL: WorkBuddyCredential = {
+  accessToken: 'access',
+  refreshToken: 'refresh',
+  expiresAtMs: Date.now() + 86_400_000,
+  domain: 'www.codebuddy.cn',
+  uid: 'uid',
+  uin: '100000000001',
+  nickname: 'Alpha',
+  source: 'desktop',
+  filePath: '/tmp/a.info',
+}
+
+const ACCOUNTS = [
+  {
+    id: 'aaa',
+    accountName: 'Alpha',
+    uin: '100000000001',
+    domain: 'www.codebuddy.cn',
+    source: 'desktop' as const,
+    tokenExpiresAtMs: CREDENTIAL.expiresAtMs,
+    filePath: '/tmp/a.info',
+    selected: true,
+  },
+  {
+    id: 'bbb',
+    accountName: 'Beta',
+    uin: '100000000002',
+    domain: '',
+    source: 'desktop' as const,
+    tokenExpiresAtMs: CREDENTIAL.expiresAtMs,
+    filePath: '/tmp/b.info',
+    selected: false,
+  },
+]
+
+/** The store mock the region dispatch hands out. */
+function baseStore(): {
+  accounts: () => Promise<typeof ACCOUNTS>
+  status: () => Promise<{ state: 'signed-in'; expiresAtMs: number }>
+  resolve: () => Promise<WorkBuddyCredential>
+  selectionLost: () => Promise<boolean>
+  hasExplicitSelection: () => boolean
+} {
+  return {
+    accounts: async () => ACCOUNTS,
+    status: async () => ({ state: 'signed-in', expiresAtMs: CREDENTIAL.expiresAtMs }),
+    resolve: async () => CREDENTIAL,
+    selectionLost: async () => false,
+    hasExplicitSelection: () => true,
+  }
+}
+
+function deps(overrides: Partial<WorkBuddyStatusRouteOptions> = {}): WorkBuddyStatusRouteOptions {
+  return {
+    store: () => baseStore() as never,
+    client: {
+      fetchCredits: async () => ({
+        total: 1875,
+        packages: [
+          { packageName: 'CodeBuddy个人体验版', remain: 41, size: 500, monthly: true, refreshAtMs: 1_799_999_999_000 },
+          { packageName: 'CodeBuddy个人版国内运营裂变包', remain: 1806, size: 2000, monthly: false, expiresAtMs: 1_800_000_000_000 },
+        ],
+        expiringSoon: 75,
+        nearestExpiryMs: 1_800_000_000_000,
+      }),
+      fetchCheckinStatus: async () => ({
+        active: true,
+        todayCheckedIn: true,
+        streakDays: 9,
+        dailyCredit: 100,
+        todayCredit: 100,
+        isStreakDay: false,
+        nextStreakDay: 0,
+        streakBonusDays: 0,
+        streakBonusCredit: 0,
+      }),
+      claimDailyCheckin: async () => ({ credit: 100, streakDays: 9, isStreakDay: false }),
+      fetchBenefits: async () => [],
+      claimBenefit: async () => undefined,
+    },
+    displayModels: () => FALLBACK_WORKBUDDY_MODELS,
+    enabledModelIds: () => ['glm-5.3'],
+    imageModelIds: () => ['glm-5.3'],
+    offModelIds: () => [],
+    contextBudgets: () => ({}),
+    regionEnabled: () => true,
+    ...overrides,
+  }
+}
+
+describe('workBuddyAccountCredits', () => {
+  /** A store exposing the given accounts, each resolving to a credential. */
+  const storeOf = (accounts: typeof ACCOUNTS) => ({
+    accounts: async () => accounts,
+    credentialFor: async (id: string) => (accounts.some(a => a.id === id) ? CREDENTIAL : undefined),
+  }) as never
+
+  it('lists a RATE-LIMITED account rather than dropping it', async () => {
+    // The question this answers: "does a rate-limited account disappear from the
+    // panel?" It must NOT. The table exists to let the user pick an account, and
+    // hiding one hides the very fact they need (why it is unusable) while also
+    // making the list silently shorter than the card's. The exclusion is carried
+    // ON the row as a label, not as a filter.
+    const rows = await workBuddyAccountCredits(deps({
+      store: () => storeOf(ACCOUNTS),
+      accountExclusions: async () => ({ [ACCOUNTS[1]!.id]: 'rate-limited' }),
+    }), 'cn')
+    expect(rows.map(row => row.id)).toEqual(ACCOUNTS.map(account => account.id))
+    expect(rows.find(row => row.id === ACCOUNTS[1]!.id)?.excludedBy).toBe('rate-limited')
+    // The healthy one carries no marker.
+    expect(rows.find(row => row.id === ACCOUNTS[0]!.id)?.excludedBy).toBeUndefined()
+  })
+
+  it('still lists an account whose balance cannot be read, with no credits figure', async () => {
+    // Omitting the number (rather than writing 0) is what lets the panel render
+    // "—" instead of claiming the account is out of credits.
+    const rows = await workBuddyAccountCredits(deps({
+      store: () => ({
+        accounts: async () => ACCOUNTS,
+        credentialFor: async (id: string) => (id === ACCOUNTS[0]!.id ? CREDENTIAL : undefined),
+      }) as never,
+      client: { ...deps().client, fetchCredits: async () => { throw new Error('upstream down') } },
+    }), 'cn')
+    expect(rows).toHaveLength(ACCOUNTS.length)
+    expect(rows.every(row => row.credits === undefined)).toBe(true)
+  })
+
+  it('lists every account when nothing has been measured', async () => {
+    const rows = await workBuddyAccountCredits(deps({ store: () => storeOf(ACCOUNTS) }), 'cn')
+    expect(rows).toHaveLength(ACCOUNTS.length)
+    expect(rows.every(row => row.excludedBy === undefined)).toBe(true)
+  })
+})
+
+describe('workBuddyWebStatus', () => {
+  it('reports signed-out with accounts when no credential resolves', async () => {
+    const status = await workBuddyWebStatus(deps({
+      store: () => ({
+        accounts: async () => ACCOUNTS,
+        status: async () => ({ state: 'signed-out' }),
+        resolve: async () => { throw new Error('workbuddy: no signed-in account') },
+        selectionLost: async () => false,
+        hasExplicitSelection: () => false,
+      }) as never,
+    }), 'cn')
+    expect(status.status).toBe('signed-out')
+    if (status.status !== 'signed-out') return
+    expect(status.accounts).toHaveLength(2)
+  })
+
+  it('reports signed-out with an empty list when no credential file exists at all', async () => {
+    const status = await workBuddyWebStatus(deps({
+      store: () => ({
+        accounts: async () => [],
+        status: async () => ({ state: 'signed-out' }),
+        resolve: async () => { throw new Error('no account') },
+        selectionLost: async () => false,
+        hasExplicitSelection: () => false,
+      }) as never,
+    }), 'cn')
+    expect(status.status).toBe('signed-out')
+    if (status.status !== 'signed-out') return
+    expect(status.accounts).toEqual([])
+  })
+
+  it('flags an orphaned saved selection so the card can stop saying "sign in again"', async () => {
+    // The saved id matches no local account while other sign-ins exist: the
+    // tokens are fine, so the generic signed-out hint would misdirect the user
+    // into re-signing in — the one action that cannot repair an orphaned id.
+    const status = await workBuddyWebStatus(deps({
+      store: () => ({
+        accounts: async () => ACCOUNTS,
+        status: async () => ({ state: 'signed-out' }),
+        resolve: async () => {
+          throw new Error('workbuddy: no signed-in WorkBuddy account found; sign in once in the WorkBuddy desktop app')
+        },
+        selectionLost: async () => true,
+        hasExplicitSelection: () => true,
+      }) as never,
+    }), 'cn')
+    expect(status.status).toBe('signed-out')
+    if (status.status !== 'signed-out') return
+    expect(status.selectionLost).toBe(true)
+    // The account list must still be offered: it is the way out of the state.
+    expect(status.accounts).toHaveLength(2)
+  })
+
+  it('does not flag selectionLost for a genuinely signed-out machine', async () => {
+    const status = await workBuddyWebStatus(deps({
+      store: () => ({
+        accounts: async () => ACCOUNTS,
+        status: async () => ({ state: 'signed-out' }),
+        resolve: async () => { throw new Error('no account') },
+        selectionLost: async () => false,
+        hasExplicitSelection: () => false,
+      }) as never,
+    }), 'cn')
+    if (status.status !== 'signed-out') throw new Error('expected signed-out')
+    expect(status.selectionLost).toBeUndefined()
+  })
+
+  it('keeps the signed-in document free of selectionLost', async () => {
+    const status = await workBuddyWebStatus(deps({
+      store: () => ({ ...baseStore(), selectionLost: async () => true }) as never,
+    }), 'cn')
+    expect(status.status).toBe('signed-in')
+    expect('selectionLost' in status).toBe(false)
+  })
+
+  it('reports whether a saved choice is in effect, so clearing is observable (issue #11)', async () => {
+    // Clearing restores "follow the app's sign-in", which usually resolves to
+    // the SAME account. Without this flag the card cannot tell the user that
+    // anything happened, which is the "the button does nothing" report.
+    const saved = await workBuddyWebStatus(deps(), 'cn')
+    if (saved.status !== 'signed-in') throw new Error('expected signed-in')
+    expect(saved.selectionExplicit).toBe(true)
+
+    const following = await workBuddyWebStatus(deps({
+      store: () => ({ ...baseStore(), hasExplicitSelection: () => false }) as never,
+    }), 'cn')
+    if (following.status !== 'signed-in') throw new Error('expected signed-in')
+    expect(following.selectionExplicit).toBe(false)
+  })
+
+  it('reports the selection state on the signed-out branches too', async () => {
+    // The picker (and its Clear button) renders on the signed-out branches, so
+    // the flag has to be there as well or the state line goes blank exactly
+    // when the user needs the way out.
+    const orphaned = await workBuddyWebStatus(deps({
+      store: () => ({
+        accounts: async () => ACCOUNTS,
+        status: async () => ({ state: 'signed-out' }),
+        resolve: async () => { throw new Error('no account') },
+        selectionLost: async () => true,
+        hasExplicitSelection: () => true,
+      }) as never,
+    }), 'cn')
+    if (orphaned.status !== 'signed-out') throw new Error('expected signed-out')
+    expect(orphaned.selectionExplicit).toBe(true)
+
+    const none = await workBuddyWebStatus(deps({
+      store: () => ({
+        accounts: async () => ACCOUNTS,
+        status: async () => ({ state: 'signed-out' }),
+        resolve: async () => { throw new Error('no account') },
+        selectionLost: async () => false,
+        hasExplicitSelection: () => false,
+      }) as never,
+    }), 'cn')
+    if (none.status !== 'signed-out') throw new Error('expected signed-out')
+    expect(none.selectionExplicit).toBe(false)
+  })
+
+  it('never puts token material in the signed-in document', async () => {
+    const status = await workBuddyWebStatus(deps(), 'cn')
+    expect(status.status).toBe('signed-in')
+    const serialized = JSON.stringify(status)
+    // Field names are the contract; leak detection is about token-shaped values.
+    expect(serialized).not.toMatch(/eyJ[A-Za-z0-9_-]+\./u)
+    expect(serialized).not.toMatch(/"(accessToken|refreshToken)"/u)
+    expect(serialized).not.toContain('access')
+  })
+
+  it('exposes the off-level selection the card renders as checkboxes (issue #34)', async () => {
+    const status = await workBuddyWebStatus(deps({
+      offModelIds: () => ['glm-5.3', 'kimi-k3'],
+    }), 'cn')
+    if (status.status !== 'signed-in') throw new Error('expected signed-in')
+    expect(status.offModelIds).toEqual(['glm-5.3', 'kimi-k3'])
+  })
+
+  it('carries the off declaration into the card payload so a save cannot strip it (issue #34)', async () => {
+    // `toWebModel` used to drop `canDisableThinking`, so the card wrote rows
+    // back without it. Since an ABSENT declaration never offers `off` (the
+    // conservative default this plugin must keep, because `hy4-preview` and
+    // `hy3-x` declare `false`), one Save silently withdrew a working level from
+    // every model the user had not overridden.
+    const status = await workBuddyWebStatus(deps({
+      displayModels: () => [{
+        id: 'glm-5.3',
+        name: 'GLM-5.3',
+        contextWindow: 1_000_000,
+        maxTokens: 48_000,
+        reasoning: { supportedEfforts: ['low', 'high', 'xhigh'], defaultEffort: 'high', canDisableThinking: true },
+      }],
+    }), 'cn')
+    if (status.status !== 'signed-in') throw new Error('expected signed-in')
+    expect(status.models[0]?.reasoning).toEqual({
+      supportedEfforts: ['low', 'high', 'xhigh'],
+      defaultEffort: 'high',
+      canDisableThinking: true,
+    })
+  })
+
+  it('omits an undeclared canDisableThinking instead of writing one', async () => {
+    // An absent declaration must stay absent: `false` would be read as an
+    // upstream answer rather than as "unknown", and an explicit `undefined`
+    // fails the strict JSON codec on the way back in.
+    const status = await workBuddyWebStatus(deps({
+      displayModels: () => [{
+        id: 'glm-5.3',
+        name: 'GLM-5.3',
+        contextWindow: 1_000_000,
+        maxTokens: 48_000,
+        reasoning: { supportedEfforts: ['low', 'high'] },
+      }],
+    }), 'cn')
+    if (status.status !== 'signed-in') throw new Error('expected signed-in')
+    expect('canDisableThinking' in (status.models[0]?.reasoning ?? {})).toBe(false)
+  })
+
+  it('carries accounts, models, selection, and credits', async () => {
+    const status = await workBuddyWebStatus(deps(), 'cn')
+    if (status.status !== 'signed-in') throw new Error('expected signed-in')
+    expect(status.accountName).toBe('Alpha')
+    expect(status.accounts).toHaveLength(2)
+    expect(status.models.length).toBe(FALLBACK_WORKBUDDY_MODELS.length)
+    const glm = status.models.find(model => model.id === 'glm-5.3')
+    // Both fields agree because no budget was set: the card reports the model's
+    // real 1M window instead of the former silent 200K clamp (issue #33). The
+    // two fields still differ the moment a budget is saved; see the budget test.
+    expect(glm).toMatchObject({ nativeContextWindow: 1_000_000, contextWindow: 1_000_000 })
+    expect(status.enabledModelIds).toEqual(['glm-5.3'])
+    expect(status.imageModelIds).toEqual(['glm-5.3'])
+    expect(status.checkin).toMatchObject({ todayCheckedIn: true, todayCredit: 100, streakDays: 9 })
+    expect(status.credits).toMatchObject({
+      total: 1875,
+      expiringSoon: 75,
+      nearestExpiryMs: 1_800_000_000_000,
+      packages: [
+        { packageName: 'CodeBuddy个人体验版', monthly: true, cycleRefreshMs: 1_799_999_999_000 },
+        { packageName: 'CodeBuddy个人版国内运营裂变包', monthly: false, expiresAtMs: 1_800_000_000_000 },
+      ],
+    })
+    // The balance is a fractional number now that it comes from the `*Precise`
+    // family (issue #58), so 41 must survive by identity rather than only via
+    // `toMatchObject`, which would not notice a rounded or dropped field.
+    const monthly = status.credits?.packages[0]
+    expect(monthly?.remain).toBe(41)
+    expect(monthly?.size).toBe(500)
+    // A gift carries no refresh point at all — absent, not zero.
+    expect('cycleRefreshMs' in (status.credits?.packages[1] as object)).toBe(false)
+  })
+
+  it('degrades a credit failure to creditsError instead of failing the document', async () => {
+    const status = await workBuddyWebStatus(deps({
+      client: {
+        fetchCredits: async () => { throw new Error('billing unavailable') },
+        fetchCheckinStatus: async () => ({ active: true, todayCheckedIn: false, streakDays: 0, dailyCredit: 100, todayCredit: 0, isStreakDay: false, nextStreakDay: 0, streakBonusDays: 0, streakBonusCredit: 0 }),
+        claimDailyCheckin: async () => ({ credit: 100, streakDays: 1, isStreakDay: false }),
+        fetchBenefits: async () => [],
+        claimBenefit: async () => undefined,
+      },
+    }), 'cn')
+    if (status.status !== 'signed-in') throw new Error('expected signed-in')
+    expect(status.credits).toBeUndefined()
+    expect(status.creditsError).toBe('billing unavailable')
+    // The account and model sections still render.
+    expect(status.models.length).toBeGreaterThan(0)
+  })
+
+  it('redacts token-like text in error messages', async () => {
+    const status = await workBuddyWebStatus(deps({
+      client: {
+        fetchCredits: async () => {
+          throw new Error('failed with eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0.sig and refresh_token=supersecret')
+        },
+        fetchCheckinStatus: async () => ({ active: true, todayCheckedIn: false, streakDays: 0, dailyCredit: 100, todayCredit: 0, isStreakDay: false, nextStreakDay: 0, streakBonusDays: 0, streakBonusCredit: 0 }),
+        claimDailyCheckin: async () => ({ credit: 100, streakDays: 1, isStreakDay: false }),
+        fetchBenefits: async () => [],
+        claimBenefit: async () => undefined,
+      },
+    }), 'cn')
+    if (status.status !== 'signed-in') throw new Error('expected signed-in')
+    expect(status.creditsError).toContain('[redacted token]')
+    expect(status.creditsError).toContain('[redacted]')
+    expect(status.creditsError).not.toContain('supersecret')
+  })
+
+  it('flags a refused credential and points at the usable account instead of saying "sign in again"', async () => {
+    const probed: string[] = []
+    const status = await workBuddyWebStatus(deps({
+      client: {
+        fetchCredits: async () => { throw new WorkBuddyCredentialRejectedError(401) },
+        fetchCheckinStatus: async () => { throw new WorkBuddyCredentialRejectedError(401) },
+        claimDailyCheckin: async () => ({ credit: 100, streakDays: 1, isStreakDay: false }),
+        fetchBenefits: async () => [],
+        claimBenefit: async () => undefined,
+      },
+      accountUsable: async (_region, account) => {
+        probed.push(account.id)
+        return account.id === 'bbb'
+      },
+    }), 'cn')
+    if (status.status !== 'signed-in') throw new Error('expected signed-in')
+    expect(status.credentialRejected).toBe(true)
+    // The selected account is 'aaa', so only the OTHER account is probed.
+    expect(probed).toEqual(['bbb'])
+    expect(status.recovery?.usableAccount).toEqual({ accountId: 'bbb', accountName: 'Beta' })
+    // Switching is the fix, so re-login must NOT be demanded.
+    expect(status.recovery?.reloginRequired).toBe(false)
+  })
+
+  it('does not claim any account is usable when the probe confirms none', async () => {
+    const status = await workBuddyWebStatus(deps({
+      client: {
+        fetchCredits: async () => { throw new WorkBuddyCredentialRejectedError(401) },
+        fetchCheckinStatus: async () => { throw new WorkBuddyCredentialRejectedError(401) },
+        claimDailyCheckin: async () => ({ credit: 100, streakDays: 1, isStreakDay: false }),
+        fetchBenefits: async () => [],
+        claimBenefit: async () => undefined,
+      },
+      accountUsable: async () => false,
+    }), 'cn')
+    if (status.status !== 'signed-in') throw new Error('expected signed-in')
+    expect(status.credentialRejected).toBe(true)
+    expect(status.recovery?.usableAccount).toBeUndefined()
+    // Other accounts exist, so "sign in again" is not the only fix and must not
+    // be asserted — that assertion is what misleads when a switch would do.
+    expect(status.recovery?.reloginRequired).toBe(false)
+  })
+
+  it('requires a re-login only when there is no other account to switch to', async () => {
+    const single = [ACCOUNTS[0]!]
+    const status = await workBuddyWebStatus(deps({
+      store: () => ({ ...baseStore(), accounts: async () => single }) as never,
+      client: {
+        fetchCredits: async () => { throw new WorkBuddyCredentialRejectedError(403) },
+        fetchCheckinStatus: async () => ({ active: true, todayCheckedIn: false, streakDays: 0, dailyCredit: 100, todayCredit: 0, isStreakDay: false, nextStreakDay: 0, streakBonusDays: 0, streakBonusCredit: 0 }),
+        claimDailyCheckin: async () => ({ credit: 100, streakDays: 1, isStreakDay: false }),
+        fetchBenefits: async () => [],
+        claimBenefit: async () => undefined,
+      },
+    }), 'cn')
+    if (status.status !== 'signed-in') throw new Error('expected signed-in')
+    expect(status.credentialRejected).toBe(true)
+    expect(status.recovery?.reloginRequired).toBe(true)
+  })
+
+  it('does not treat an ordinary upstream fault as a refused credential', async () => {
+    // A transient failure needs a retry, not a re-login: classifying it as a
+    // credential problem would send the user to re-authenticate for nothing.
+    const status = await workBuddyWebStatus(deps({
+      client: {
+        fetchCredits: async () => { throw new Error('workbuddy upstream server (http 503): busy') },
+        fetchCheckinStatus: async () => { throw new Error('workbuddy upstream server (http 503): busy') },
+        claimDailyCheckin: async () => ({ credit: 100, streakDays: 1, isStreakDay: false }),
+        fetchBenefits: async () => [],
+        claimBenefit: async () => undefined,
+      },
+    }), 'cn')
+    if (status.status !== 'signed-in') throw new Error('expected signed-in')
+    expect(status.credentialRejected).toBeUndefined()
+    expect(status.recovery).toBeUndefined()
+  })
+
+  it('classifies a JSON 401 body as a refused credential too', async () => {
+    // The edge usually answers HTML, but a business-shaped 401 means the same
+    // thing about the token, so it must reach the same advice.
+    const status = await workBuddyWebStatus(deps({
+      client: {
+        fetchCredits: async () => { throw new WorkBuddyCredentialRejectedError(401) },
+        fetchCheckinStatus: async () => ({ active: true, todayCheckedIn: false, streakDays: 0, dailyCredit: 100, todayCredit: 0, isStreakDay: false, nextStreakDay: 0, streakBonusDays: 0, streakBonusCredit: 0 }),
+        claimDailyCheckin: async () => ({ credit: 100, streakDays: 1, isStreakDay: false }),
+        fetchBenefits: async () => [],
+        claimBenefit: async () => undefined,
+      },
+      accountUsable: async () => false,
+    }), 'cn')
+    if (status.status !== 'signed-in') throw new Error('expected signed-in')
+    expect(status.credentialRejected).toBe(true)
+  })
+})
+
+describe('workBuddyWebStatus region routing', () => {
+  it('reads the requested region\'s model slot and echoes the region', async () => {
+    const seen: string[] = []
+    const status = await workBuddyWebStatus(deps({
+      displayModels: region => { seen.push(`models:${region}`); return FALLBACK_WORKBUDDY_MODELS },
+      enabledModelIds: region => { seen.push(`enabled:${region}`); return ['hy3'] },
+      imageModelIds: region => { seen.push(`image:${region}`); return [] },
+      contextBudgets: region => { seen.push(`budgets:${region}`); return {} },
+    }), 'global')
+    if (status.status !== 'signed-in') throw new Error('expected signed-in')
+    // The document's region is the requested one — the card writes its save
+    // into that region's slot, so it must match the tab the user is on.
+    expect(status.region).toBe('global')
+    expect(new Set(seen)).toEqual(new Set([
+      'models:global',
+      'enabled:global',
+      'image:global',
+      'budgets:global',
+    ]))
+  })
+
+  it('answers the cn region for the domestic tab', async () => {
+    const status = await workBuddyWebStatus(deps(), 'cn')
+    if (status.status !== 'signed-in') throw new Error('expected signed-in')
+    expect(status.region).toBe('cn')
+  })
+
+  it('hands the requested region to the region-scoped store', async () => {
+    const seenRegions: string[] = []
+    const status = await workBuddyWebStatus(deps({
+      store: region => {
+        seenRegions.push(region)
+        return baseStore() as never
+      },
+    }), 'global')
+    if (status.status !== 'signed-in') throw new Error('expected signed-in')
+    expect(seenRegions).toEqual(['global'])
+    expect(status.region).toBe('global')
+  })
+})
+
+describe('registerWorkBuddyStatusRoute', () => {
+  /** A captured route entry: the path plus its HTTP handler. */
+  interface CapturedEntry {
+    path: string
+    handler: (req: unknown, res: unknown) => Promise<void> | void
+  }
+
+  /** Mount the status routes against a fake webServer; return the captures. */
+  async function mountRoutes(
+    options: Partial<WorkBuddyStatusRouteOptions> = {},
+  ): Promise<CapturedEntry[]> {
+    const captured: CapturedEntry[] = []
+    const FakeWebServer = {
+      name: 'webServer',
+      inject: [] as const,
+      apply(ctx: Context) {
+        ctx.provide('webServer', {
+          register: (entry: { path: string }) => {
+            captured.push(entry as CapturedEntry)
+            return () => {}
+          },
+        })
+      },
+    }
+    const ctx = new Context()
+    await ctx.plugin(FakeWebServer)
+    const { registerWorkBuddyStatusRoute } = await import('../src/web-status.ts')
+    registerWorkBuddyStatusRoute(ctx, deps(options))
+    await ctx.fiber.dispose()
+    return captured
+  }
+
+  it('mounts the usage, account, check-in, benefit, model, probe, speed, pool, save, oauth, and transfer routes', async () => {
+    const captured = await mountRoutes()
+    expect(captured.map(entry => entry.path)).toEqual([
+      '/plugins/dsh-connect-workbuddy/usage',
+      // Per-account balances for the composer panel; registered beside the usage
+      // route because it is the same read surface, fetched only on demand.
+      '/plugins/dsh-connect-workbuddy/account-credits',
+      '/plugins/dsh-connect-workbuddy/accounts/refresh',
+      '/plugins/dsh-connect-workbuddy/checkin',
+      // The one claim route (issue #79): POST + loopback, one account per call.
+      '/plugins/dsh-connect-workbuddy/benefit/claim',
+      '/plugins/dsh-connect-workbuddy/models/refresh',
+      '/plugins/dsh-connect-workbuddy/probe',
+      // Output-speed measurement (issue #92). Its own route because it asks the
+      // opposite question with the opposite request shape: tiny input, long
+      // output, and a fraction of a probe's cost.
+      '/plugins/dsh-connect-workbuddy/tps',
+      '/plugins/dsh-connect-workbuddy/pool',
+      '/plugins/dsh-connect-workbuddy/__save',
+      '/plugins/dsh-connect-workbuddy/oauth',
+      '/plugins/dsh-connect-workbuddy/transfer',
+      // The live board the composer pill polls (CLI route only). Read-only, and
+      // registered unconditionally so the pill can tell "no turn" from "no
+      // route" without the client having to know the switch's state.
+      '/plugins/dsh-connect-workbuddy/cli-live',
+    ])
+  })
+
+  /** Mount the status routes; return the accounts/refresh handler. */
+  async function mountAccountsRefreshHandler(
+    options: Partial<WorkBuddyStatusRouteOptions> = {},
+  ): Promise<CapturedEntry['handler']> {
+    const captured = await mountRoutes(options)
+    const refresh = captured.find(entry => entry.path === WORKBUDDY_ACCOUNTS_REFRESH_PATH)
+    if (refresh === undefined) throw new Error('account refresh route was not registered')
+    return refresh.handler
+  }
+
+  it('clears hidden accounts on a manual scan, then lists what the machine has', async () => {
+    // 「Detect accounts again」 is the user asking for the current accounts, so it
+    // must also undo the hides made by row removal. The order matters: clearing
+    // has to happen BEFORE the read, or the scan would answer with the still-
+    // hidden list and the accounts would only return on the NEXT scan.
+    const order: string[] = []
+    const handler = await mountAccountsRefreshHandler({
+      store: () => ({
+        ...baseStore(),
+        async clearDismissals() { order.push('clear'); return true },
+        async accounts() { order.push('read'); return ACCOUNTS },
+      }) as never,
+    })
+    const { res, status, body } = response()
+    await handler(request('POST', undefined, WORKBUDDY_ACCOUNTS_REFRESH_PATH + '?region=cn'), res)
+    expect(status()).toBe(200)
+    expect(order).toEqual(['clear', 'read'])
+    expect((body() as { accounts: unknown[] }).accounts.length).toBe(ACCOUNTS.length)
+  })
+
+  it('tells the card when the hides could NOT be cleared', async () => {
+    // The manual scan cannot always lift the hides: on Windows a locked vault
+    // file defeats both the unlink and the rewrite (see `clearDismissals`), and
+    // the accounts may legitimately still be hidden afterwards. The route must
+    // FORWARD that answer rather than swallow it — `dismissalsCleared: false` is
+    // what lets the card say 「still hidden」 instead of rendering a button press
+    // that appears to have worked.
+    const handler = await mountAccountsRefreshHandler({
+      store: () => ({
+        ...baseStore(),
+        async clearDismissals() { return false },
+        async accounts() { return ACCOUNTS },
+      }) as never,
+    })
+    const { res, status, body } = response()
+    await handler(request('POST', undefined, WORKBUDDY_ACCOUNTS_REFRESH_PATH + '?region=cn'), res)
+    expect(status()).toBe(200)
+    expect((body() as { dismissalsCleared?: boolean }).dismissalsCleared).toBe(false)
+    // A failed CLEAR is not a failed SCAN: the accounts that are visible must
+    // still come back, or a locked bookkeeping file would cost the user the
+    // whole list.
+    expect((body() as { accounts: unknown[] }).accounts.length).toBe(ACCOUNTS.length)
+  })
+
+  /** Mount the status routes; return the model-refresh handler. */
+  async function mountRefreshHandler(
+    options: Partial<WorkBuddyStatusRouteOptions> = {},
+  ): Promise<CapturedEntry['handler']> {
+    const captured = await mountRoutes(options)
+    const refresh = captured.find(entry => entry.path === WORKBUDDY_MODELS_REFRESH_PATH)
+    if (refresh === undefined) throw new Error('model refresh route was not registered')
+    return refresh.handler
+  }
+
+  /** Mount the status routes; return the transfer handler. */
+  async function mountTransferHandler(
+    options: Partial<WorkBuddyStatusRouteOptions> = {},
+  ): Promise<CapturedEntry['handler']> {
+    const captured = await mountRoutes(options)
+    const transfer = captured.find(entry => entry.path === '/plugins/dsh-connect-workbuddy/transfer')
+    if (transfer === undefined) throw new Error('transfer route was not registered')
+    return transfer.handler
+  }
+
+  /** A request double carrying a JSON body (the transfer route reads one). */
+  function transferReq(payload: unknown, url: string) {
+    const chunks = [Buffer.from(JSON.stringify(payload))]
+    return {
+      method: 'POST',
+      url,
+      headers: { origin: 'http://127.0.0.1' },
+      on: (ev: string, cb: (c: Buffer) => void) => {
+        if (ev === 'data') for (const c of chunks) cb(c)
+        if (ev === 'end') (cb as unknown as { (): void }).call(undefined)
+      },
+    }
+  }
+
+  it('refuses a GET on the transfer route with 405 before reading anything', async () => {
+    const handler = await mountTransferHandler()
+    const { res, status } = response()
+    await handler(request('GET', undefined, '/plugins/dsh-connect-workbuddy/transfer?region=cn&action=export'), res)
+    expect(status()).toBe(405)
+  })
+
+  it('routes export to the region\'s deps and refuses an empty selection with 400', async () => {
+    const asked: { region: string, ids: readonly string[] }[] = []
+    const handler = await mountTransferHandler({
+      transfer: {
+        exportAccounts: async (region, ids) => {
+          asked.push({ region, ids })
+          return { accounts: [{ access_token: 'at-' + ids[0] }] }
+        },
+        previewImport: async () => ({ accounts: [], total: 0 }),
+        importAccounts: async () => ({ imported: 0, skipped: 0 }),
+      },
+    })
+    const ok = response()
+    await handler(transferReq({ accountIds: ['a', 'b'] }, '/plugins/dsh-connect-workbuddy/transfer?region=global&action=export'), ok.res)
+    expect(ok.status()).toBe(200)
+    expect(ok.body()).toMatchObject({ accounts: [{ access_token: 'at-a' }] })
+    expect(asked).toEqual([{ region: 'global', ids: ['a', 'b'] }])
+    const empty = response()
+    await handler(transferReq({}, '/plugins/dsh-connect-workbuddy/transfer?region=cn&action=export'), empty.res)
+    expect(empty.status()).toBe(400)
+  })
+
+  it('answers preview with the desensitized listing and import with the counters', async () => {
+    const seenIndexes: number[][] = []
+    const handler = await mountTransferHandler({
+      transfer: {
+        exportAccounts: async () => ({ accounts: [] }),
+        previewImport: async () => ({ accounts: [{ index: 0, uid: 'u-1', nickname: 'n', email: '', hasToken: true }], total: 1 }),
+        importAccounts: async (_region, _text, indexes) => {
+          seenIndexes.push([...indexes])
+          return { imported: 1, skipped: 2 }
+        },
+      },
+    })
+    const preview = response()
+    await handler(transferReq({ text: '[{"access_token":"t"}]' }, '/plugins/dsh-connect-workbuddy/transfer?region=cn&action=preview'), preview.res)
+    expect(preview.status()).toBe(200)
+    expect(preview.body()).toMatchObject({ total: 1, accounts: [{ index: 0, hasToken: true }] })
+    const imported = response()
+    await handler(transferReq({ text: '[{"access_token":"t"}]', indexes: [0, 3] }, '/plugins/dsh-connect-workbuddy/transfer?region=cn&action=import'), imported.res)
+    expect(imported.status()).toBe(200)
+    expect(imported.body()).toMatchObject({ imported: 1, skipped: 2 })
+    expect(seenIndexes).toEqual([[0, 3]])
+  })
+
+  it('answers 503 when the build carries no transfer deps', async () => {
+    const handler = await mountTransferHandler()
+    const { res, status } = response()
+    await handler(request('POST', undefined, '/plugins/dsh-connect-workbuddy/transfer?region=cn&action=preview'), res)
+    expect(status()).toBe(503)
+  })
+
+  it('hands the refreshed rows upstream\'s own image default', async () => {
+    // The card overwrites its image checkboxes from this, so the refreshed
+    // document must carry the upstream answer per model. `multimodal` stays
+    // absent: the effective flag is the saved selection, not a live read.
+    const handler = await mountRefreshHandler({
+      discoverModels: async () => [
+        { id: 'glm-5.3', name: 'GLM-5.3', contextWindow: 1_000_000, maxTokens: 48_000, supportsImages: true },
+        { id: 'deepseek-v4-pro', name: 'Deepseek-V4-Pro', contextWindow: 1_000_000, maxTokens: 50_000, supportsImages: false },
+        { id: 'hy3', name: 'Hy3', contextWindow: 192_000, maxTokens: 64_000 },
+      ],
+    })
+    const { res, status, body } = response()
+    await handler(request(), res)
+    expect(status()).toBe(200)
+    const models = (body() as { models?: { id: string; supportsImages?: boolean }[] }).models ?? []
+    expect(models.map(model => model.id)).toEqual(['glm-5.3', 'deepseek-v4-pro', 'hy3'])
+    const [glm, deepseek, hy3] = models
+    if (glm === undefined || deepseek === undefined || hy3 === undefined) throw new Error('refresh returned no models')
+    expect(glm.supportsImages).toBe(true)
+    expect(deepseek.supportsImages).toBe(false)
+    // An upstream entry that says nothing must not read as "supports": the
+    // checkbox has to stay unchecked rather than being pre-checked on a guess.
+    expect(hy3.supportsImages).toBeUndefined()
+    expect('supportsImages' in hy3).toBe(false)
+  })
+
+  it('routes the region query to that region\'s store, defaulting to cn', async () => {
+    const seenRegions: string[] = []
+    const captured = await mountRoutes({
+      store: region => {
+        seenRegions.push(region)
+        return baseStore() as never
+      },
+    })
+    const usage = captured.find(entry => entry.path === WORKBUDDY_USAGE_PATH)
+    if (usage === undefined) throw new Error('usage route was not registered')
+    const first = response()
+    await usage.handler(request('GET', undefined, `${WORKBUDDY_USAGE_PATH}?region=global`), first.res)
+    expect(first.status()).toBe(200)
+    expect(first.body()).toMatchObject({ status: 'signed-in', region: 'global' })
+    expect(seenRegions.slice()).toEqual(['global'])
+    const second = response()
+    await usage.handler(request('GET', undefined, WORKBUDDY_USAGE_PATH), second.res)
+    expect(second.status()).toBe(200)
+    expect(second.body()).toMatchObject({ region: 'cn' })
+    expect(seenRegions).toEqual(['global', 'cn'])
+  })
+
+  it('refuses an unknown region with 400 before touching the store', async () => {
+    const seenRegions: string[] = []
+    const captured = await mountRoutes({
+      store: region => {
+        seenRegions.push(region)
+        return baseStore() as never
+      },
+    })
+    const usage = captured.find(entry => entry.path === WORKBUDDY_USAGE_PATH)
+    if (usage === undefined) throw new Error('usage route was not registered')
+    const { res, status, body } = response()
+    await usage.handler(request('GET', undefined, `${WORKBUDDY_USAGE_PATH}?region=eu`), res)
+    expect(status()).toBe(400)
+    expect(body()).toMatchObject({ error: 'unknown region' })
+    expect(seenRegions).toEqual([])
+  })
+
+  /** Mount the status routes against a fake webServer; return the check-in handler. */
+  async function mountCheckinHandler(
+    options: Partial<WorkBuddyStatusRouteOptions> = {},
+  ): Promise<CapturedEntry['handler']> {
+    const captured = await mountRoutes(options)
+    const checkin = captured.find(entry => entry.path === WORKBUDDY_CHECKIN_PATH)
+    if (checkin === undefined) throw new Error('check-in route was not registered')
+    return checkin.handler
+  }
+
+  /** Minimal request; an absent Origin header reads as loopback. */
+  function request(method = 'POST', origin?: string, url?: string): { method: string; url: string; headers: { origin?: string } } {
+    return { method, url: url ?? '/', headers: origin === undefined ? {} : { origin } }
+  }
+
+  /** Response recorder: json() only needs writeHead + end. */
+  function response(): {
+    res: { writeHead: (status: number, headers?: Record<string, string>) => void; end: (payload?: string) => void }
+    status: () => number
+    body: () => unknown
+  } {
+    let statusCode = 0
+    let payload = ''
+    return {
+      res: {
+        writeHead: (status: number) => { statusCode = status },
+        end: (body?: string) => { payload = body ?? '' },
+      },
+      status: () => statusCode,
+      body: () => JSON.parse(payload),
+    }
+  }
+
+  /** Check-in status with every field, matching the upstream document. */
+  function checkinStatus(overrides: Partial<{ active: boolean; todayCheckedIn: boolean; streakDays: number }>) {
+    return {
+      active: true,
+      todayCheckedIn: false,
+      streakDays: 0,
+      dailyCredit: 100,
+      todayCredit: 0,
+      isStreakDay: false,
+      nextStreakDay: 0,
+      streakBonusDays: 0,
+      streakBonusCredit: 0,
+      ...overrides,
+    }
+  }
+
+  it('refuses with 409 and never claims when the activity is inactive (global-account shape)', async () => {
+    const claims: number[] = []
+    const handler = await mountCheckinHandler({
+      client: {
+        fetchCredits: async () => { throw new Error('unused') },
+        fetchCheckinStatus: async () => checkinStatus({ active: false }),
+        claimDailyCheckin: async () => { claims.push(1); return { credit: 100, streakDays: 1, isStreakDay: false } },
+        fetchBenefits: async () => [],
+        claimBenefit: async () => undefined,
+      },
+    })
+    const { res, status, body } = response()
+    await handler(request(), res)
+    expect(status()).toBe(409)
+    expect(claims).toEqual([])
+    expect(body()).toMatchObject({ error: 'check-in activity is not active' })
+  })
+
+  it('answers alreadyCheckedIn without calling the upstream claim', async () => {
+    const claims: number[] = []
+    const handler = await mountCheckinHandler({
+      client: {
+        fetchCredits: async () => { throw new Error('unused') },
+        fetchCheckinStatus: async () => checkinStatus({ active: true, todayCheckedIn: true, streakDays: 11 }),
+        claimDailyCheckin: async () => { claims.push(1); return { credit: 0, streakDays: 11, isStreakDay: false } },
+        fetchBenefits: async () => [],
+        claimBenefit: async () => undefined,
+      },
+    })
+    const { res, status, body } = response()
+    await handler(request(), res)
+    expect(status()).toBe(200)
+    expect(claims).toEqual([])
+    expect(body()).toMatchObject({ alreadyCheckedIn: true })
+  })
+
+  it('claims exactly once for an active unchecked day and returns the refreshed status', async () => {
+    const claims: number[] = []
+    const reads: number[] = []
+    const handler = await mountCheckinHandler({
+      client: {
+        fetchCredits: async () => { throw new Error('unused') },
+        // First read (the guard) reports unchecked; the post-claim refresh
+        // reports the day as claimed, exactly like the upstream does.
+        fetchCheckinStatus: async () => {
+          reads.push(1)
+          return checkinStatus({ todayCheckedIn: reads.length > 1, streakDays: reads.length > 1 ? 6 : 5 })
+        },
+        claimDailyCheckin: async () => { claims.push(1); return { credit: 100, streakDays: 6, isStreakDay: false } },
+        fetchBenefits: async () => [],
+        claimBenefit: async () => undefined,
+      },
+    })
+    const { res, status, body } = response()
+    await handler(request('POST', undefined, `${WORKBUDDY_CHECKIN_PATH}?region=global`), res)
+    expect(status()).toBe(200)
+    expect(claims).toHaveLength(1)
+    expect(reads).toHaveLength(2)
+    expect(body()).toMatchObject({
+      alreadyCheckedIn: false,
+      claim: { credit: 100, streakDays: 6 },
+      checkin: { todayCheckedIn: true, streakDays: 6 },
+    })
+  })
+
+  it('refuses non-loopback origins with 403 before touching the upstream', async () => {
+    const handler = await mountCheckinHandler()
+    const { res, status } = response()
+    await handler(request('POST', 'https://evil.example.com'), res)
+    expect(status()).toBe(403)
+  })
+
+  it('refuses non-POST methods with 405', async () => {
+    const handler = await mountCheckinHandler()
+    const { res, status } = response()
+    await handler(request('GET'), res)
+    expect(status()).toBe(405)
+  })
+})
+
+/**
+ * The card document must not carry identifiers the card never renders.
+ *
+ * `uin` was forwarded to the browser while nothing ever displayed it, which
+ * made it pure exposure of an account identifier. The name travels as a name
+ * (empty when unknown) so the card can supply its own placeholder.
+ */
+describe('workBuddyWebStatus account identifiers', () => {
+  it('never sends uin to the browser', async () => {
+    const status = await workBuddyWebStatus(deps(), 'cn')
+    if (status.status !== 'signed-in') throw new Error('expected signed-in')
+    const payload = JSON.stringify(status)
+    expect(payload).not.toContain('100000000001')
+    expect(payload).not.toContain('100000000002')
+    for (const account of status.accounts) {
+      expect(Object.keys(account)).not.toContain('uin')
+    }
+    expect(Object.keys(status)).not.toContain('uin')
+  })
+
+  it('sends an empty name rather than an identifier when no nickname exists', async () => {
+    // `exactOptionalPropertyTypes` forbids assigning `undefined`, so the field
+    // is omitted rather than blanked.
+    const { nickname: _dropped, ...withoutNickname } = CREDENTIAL
+    const nameless: WorkBuddyCredential = withoutNickname
+    const status = await workBuddyWebStatus(deps({
+      store: () => ({
+        ...baseStore(),
+        resolve: async () => nameless,
+        accounts: async () => [{ ...ACCOUNTS[0]!, accountName: '' }],
+      }) as never,
+    }), 'cn')
+    if (status.status !== 'signed-in') throw new Error('expected signed-in')
+    expect(status.accountName).toBe('')
+    expect(status.accounts[0]?.accountName).toBe('')
+    // The account is still identified for the picker by its id...
+    expect(status.accountId).toBe('aaa')
+    // ...and no identifier leaks through the name.
+    expect(status.accountName).not.toContain('100000000001')
+  })
+})
+
+describe('workBuddyWebStatus probed-path diagnostics', () => {
+  /** A store that resolves nothing and explains why, in the given ways. */
+  function signedOutStore(failures: readonly unknown[]): never {
+    return {
+      accounts: async () => [],
+      status: async () => ({ state: 'signed-out' }),
+      resolve: async () => { throw new Error('no account') },
+      selectionLost: async () => false,
+      hasExplicitSelection: () => false,
+      diagnose: async () => ({ tried: ['/a', '/b'], failures }),
+    } as never
+  }
+
+  it('surfaces the probed paths when nothing at all was found', async () => {
+    // The signed-out card is only actionable if it can say WHERE it looked: a
+    // user whose WorkBuddy keeps its login elsewhere needs that list to point
+    // the plugin at the right file.
+    const status = await workBuddyWebStatus(deps({
+      store: () => signedOutStore([
+        { path: '/home/u/.workbuddy/auth/workbuddy-desktop.info', source: 'desktop', reason: 'missing' },
+      ]),
+    }), 'cn')
+    if (status.status !== 'signed-out') throw new Error('expected signed-out')
+    expect(status.searched).toEqual([
+      { path: '/home/u/.workbuddy/auth/workbuddy-desktop.info', source: 'desktop', reason: 'missing' },
+    ])
+  })
+
+  it('carries the encrypted reason through to the browser', async () => {
+    // The whole point of a separate reason: the card must be able to tell
+    // "you are signed in but the app is missing" from "there is no token".
+    const status = await workBuddyWebStatus(deps({
+      store: () => signedOutStore([
+        { path: '/x/auth.info', source: 'desktop', reason: 'encrypted', message: 'no key available' },
+      ]),
+    }), 'cn')
+    if (status.status !== 'signed-out') throw new Error('expected signed-out')
+    expect(status.searched?.[0]).toMatchObject({ reason: 'encrypted', source: 'desktop' })
+  })
+
+  it('carries the wrong-region reason through to the browser', async () => {
+    // End of the chain behind the reported `(1)`: the file holds a valid sign-in
+    // for the other tab, `diagnose()` reports it, and the card must receive it.
+    // If this entry is dropped anywhere along the way, the user's real sign-in
+    // is invisible AND the "Paths checked" count is short by one.
+    const status = await workBuddyWebStatus(deps({
+      store: () => signedOutStore([
+        {
+          path: '/x/auth/workbuddy-desktop.info',
+          source: 'desktop',
+          reason: 'wrong-region',
+          message: 'holds a global sign-in, but this tab reads the cn region',
+        },
+        { path: '/x/other/auth/workbuddy-desktop.info', source: 'desktop', reason: 'missing' },
+      ]),
+    }), 'cn')
+    if (status.status !== 'signed-out') throw new Error('expected signed-out')
+    expect(status.searched).toHaveLength(2)
+    expect(status.searched?.[0]).toMatchObject({ reason: 'wrong-region', source: 'desktop' })
+  })
+
+  it('omits an empty probe list rather than sending an empty array', async () => {
+    // `[]` would make the card render an empty "Paths checked (0)" block.
+    const status = await workBuddyWebStatus(deps({
+      store: () => signedOutStore([]),
+    }), 'cn')
+    if (status.status !== 'signed-out') throw new Error('expected signed-out')
+    expect(status.searched).toBeUndefined()
+  })
+
+  it('degrades to the plain signed-out hint when the store cannot diagnose', async () => {
+    // An older Host, or any store built without diagnostics. The card must not
+    // lose its signed-out state over a diagnostic it cannot produce.
+    const status = await workBuddyWebStatus(deps({
+      store: () => ({
+        accounts: async () => [],
+        status: async () => ({ state: 'signed-out' }),
+        resolve: async () => { throw new Error('no account') },
+        selectionLost: async () => false,
+        hasExplicitSelection: () => false,
+      }) as never,
+    }), 'cn')
+    if (status.status !== 'signed-out') throw new Error('expected signed-out')
+    expect(status.searched).toBeUndefined()
+  })
+
+  it('never lets a diagnostics failure break the status route', async () => {
+    // `diagnose()` re-reads the filesystem; an exotic error there must not turn
+    // the whole card into an error state.
+    const status = await workBuddyWebStatus(deps({
+      store: () => ({
+        accounts: async () => [],
+        status: async () => ({ state: 'signed-out' }),
+        resolve: async () => { throw new Error('no account') },
+        selectionLost: async () => false,
+        hasExplicitSelection: () => false,
+        diagnose: async () => { throw new Error('the disk went away') },
+      }) as never,
+    }), 'cn')
+    expect(status.status).toBe('signed-out')
+    if (status.status !== 'signed-out') return
+    expect(status.searched).toBeUndefined()
+  })
+
+  it('does not list probed paths when local sign-ins merely lost their saved selection', async () => {
+    // The orphaned-id case: tokens are healthy and the fix is to re-pick the
+    // account. A list of failed paths would bury that with an irrelevant story.
+    const status = await workBuddyWebStatus(deps({
+      store: () => ({
+        ...(signedOutStore([{ path: '/x/auth.info', source: 'desktop', reason: 'missing' }]) as object),
+        accounts: async () => ACCOUNTS,
+        selectionLost: async () => true,
+      }) as never,
+    }), 'cn')
+    if (status.status !== 'signed-out') throw new Error('expected signed-out')
+    expect(status.selectionLost).toBe(true)
+    expect(status.searched).toBeUndefined()
+  })
+
+  it('scrubs token-shaped content inside a probe message before it reaches the browser', async () => {
+    // Probe messages come from the filesystem and from the desktop app's child
+    // process, either of which can echo back a token fragment. The reason list
+    // must not become a new leak channel just because it is diagnostic copy.
+    const jwt = 'eyJhbGciOiJSUzI1NiJ9.eyJzdWIiOiJ1aWQtMSJ9.c2lnbmF0dXJl'
+    const status = await workBuddyWebStatus(deps({
+      store: () => signedOutStore([
+        {
+          path: '/x/auth.info',
+          source: 'desktop',
+          reason: 'unreadable',
+          message: `failed reading the document (access_token=${jwt})`,
+        },
+      ]),
+    }), 'cn')
+    if (status.status !== 'signed-out') throw new Error('expected signed-out')
+    const sent = JSON.stringify(status.searched)
+    expect(sent).not.toContain('c2lnbmF0dXJl')
+    expect(sent).toContain('[redacted')
+    // The path itself is the point of the feature and must survive.
+    expect(status.searched?.[0]?.path).toBe('/x/auth.info')
+  })
+})
+
+describe('registerWorkBuddyStatusRoute __save with a live-reference config', () => {
+  interface CapturedEntry { path: string; handler: (req: unknown, res: unknown) => Promise<void> | void }
+
+  /**
+   * Mount the status routes against a fake webServer AND a fake settings
+   * service whose resolved config carries `{get()}` live references for the
+   * volatile fields, exactly as the pinned schemastery resolves them.
+   * `mutate` replicates the real JSON-compatibility gate.
+   */
+  async function mountSaveRoutes(
+    options: Partial<WorkBuddyStatusRouteOptions> = {},
+    /** Overrides the Host's resolved `regions` value; defaults to a CN slot. */
+    regionsValue?: Record<string, unknown>,
+  ) {
+    // Returns the LIVE context plus the captured handler. The handler must be
+    // invoked BEFORE the fiber is disposed: `__save` reads `ctx.get('settings')`
+    // at request time, and after `fiber.dispose()` every service is gone (the
+    // handler would then answer 503 "settings service unavailable").
+    const ctx = new Context()
+    try {
+    
+
+    const captured: CapturedEntry[] = []
+    const mutateReceived: unknown[][] = []
+    let settingsDescribes = 0
+    const FakeWebServer = {
+      name: 'webServer', inject: [] as const,
+      apply(ctx: Context) {
+        ctx.provide('webServer', { register: (entry: CapturedEntry) => { captured.push(entry); return () => {} } })
+      },
+    }
+    const FakeSettings = {
+      name: 'settings', inject: [] as const,
+      apply(ctx: Context) {
+        ctx.provide('settings', {
+          describe: () => {
+            settingsDescribes += 1
+            return [{ ns: 'workbuddy', value: { regions: $regionsRef(), accounts: {} } }]
+          },
+          mutate: async (ns: string, ops: unknown[]) => {
+            if (JSON.stringify(ops) === undefined) {
+              throw new TypeError('settings mutate for "workbuddy" must contain only JSON-compatible data (found a function at $.ops[0].value.get)')
+            }
+            mutateReceived.push([ns, ops])
+          },
+        })
+      },
+    }
+    // A live reference with the same {get()} shape a volatile field resolves to.
+    const $regionsRef = () => ({
+      get: () => regionsValue ?? ({ cn: { enabled: true, contextBudgets: { 'glm-5.3': 1_000_000 } } }),
+    })
+
+    await ctx.plugin(FakeWebServer)
+    await ctx.plugin(FakeSettings)
+    const { registerWorkBuddyStatusRoute } = await import('../src/web-status.ts')
+    registerWorkBuddyStatusRoute(ctx, deps(options))
+    const save = captured.find(entry => entry.path.endsWith('__save'))
+    if (save === undefined) throw new Error('__save route was not registered')
+    return {
+      ctx,
+      handler: save.handler,
+      mutateReceived,
+      settingsDescribes,
+      dispose: () => { void ctx.fiber.dispose() },
+    }
+    } finally { /* caller disposes */ }
+  }
+
+  function saveResponse(): { res: { writeHead: (s: number, h?: Record<string, string>) => void; end: (b?: string) => void }, status: () => number, body: () => unknown } {
+    let statusCode = 0
+    let payload = ''
+    return {
+      res: { writeHead: (s: number) => { statusCode = s }, end: (b?: string) => { payload = b ?? '' } },
+      status: () => statusCode,
+      body: () => JSON.parse(payload),
+    }
+  }
+
+  function saveReq(payload: unknown) {
+    const chunks = [Buffer.from(JSON.stringify(payload))]
+    return {
+      method: 'POST',
+      url: '/plugins/dsh-connect-workbuddy/__save',
+      headers: { origin: 'http://127.0.0.1' },
+      on: (ev: string, cb: (c: Buffer) => void) => {
+        if (ev === 'data') for (const c of chunks) cb(c)
+        if (ev === 'end') (cb as unknown as { (): void }).call(undefined)
+      },
+    }
+  }
+
+  it('persists contextBudgets without leaking the live reference into mutate', async () => {
+    const { handler, mutateReceived, dispose } = await mountSaveRoutes()
+    const { res, status } = saveResponse()
+    await handler(saveReq({ field: 'regions', value: { cn: { enabled: true, contextBudgets: { 'glm-5.3': 1_000_000 } } } }), res)
+    dispose()
+    expect(status()).toBe(200)
+    expect(mutateReceived).toHaveLength(1)
+    // The payload handed to mutate must survive JSON round-trip (no function).
+    const tuple = mutateReceived[0]
+    expect(tuple?.[0]).toBe('workbuddy')
+    const ops = tuple?.[1] as unknown
+    const restored = JSON.parse(JSON.stringify(ops)) as unknown
+    expect(restored).toEqual(ops)
+    // The incoming region's budget is present.
+    const first = (ops as Array<{ value: Record<string, unknown> }>)[0]
+    expect(first).toBeDefined()
+    const value = (first as { value: Record<string, unknown> }).value as Record<string, unknown>
+    expect(value).toMatchObject({ cn: { contextBudgets: { 'glm-5.3': 1_000_000 } } })
+  })
+
+  it('persists the off selection through the strict JSON write path (issue #34)', async () => {
+    const { handler, mutateReceived, dispose } = await mountSaveRoutes({}, {
+      cn: { enabled: true, lastCatalog: [{ id: 'glm-5.3', name: 'GLM-5.3', contextWindow: 1_000_000, maxTokens: 48_000 }] },
+    })
+    const { res, status } = saveResponse()
+    await handler(saveReq({
+      field: 'regions',
+      value: { cn: { offModelIds: ['deepseek-v4.1-flash', 'glm-5.3'] } },
+    }), res)
+    dispose()
+    expect(status()).toBe(200)
+    const ops = mutateReceived[0]?.[1] as Array<{ value: Record<string, unknown> }>
+    const value = ops[0]?.value as Record<string, unknown>
+    expect(value).toMatchObject({
+      cn: { offModelIds: ['deepseek-v4.1-flash', 'glm-5.3'] },
+    })
+  })
+
+  it('keeps saved off overrides when a later save omits them (issue #32 shape)', async () => {
+    // A save that posts only `pool` (the real Windows payload) must not drop
+    // the override map: an OMITTED key is preserved, exactly as for
+    // `lastCatalog` and `contextBudgets`.
+    const { handler, mutateReceived, dispose } = await mountSaveRoutes({}, {
+      cn: { enabled: true, offModelIds: ['gemini-3.5-flash'] },
+    })
+    const { res, status } = saveResponse()
+    await handler(saveReq({ field: 'regions', value: { cn: { pool: { enabled: true } } } }), res)
+    dispose()
+    expect(status()).toBe(200)
+    const ops = mutateReceived[0]?.[1] as Array<{ value: Record<string, unknown> }>
+    const value = ops[0]?.value as Record<string, unknown>
+    expect(value).toMatchObject({ cn: { offModelIds: ['gemini-3.5-flash'] } })
+  })
+
+  it('does NOT delete region fields the caller omitted (the pool-save data loss)', async () => {
+    // THE regression. Saving pool preferences posts only what the client knows:
+    // `{ cn: { pool } }`. A one-level spread replaced the WHOLE cn slot, so a
+    // real Windows profile lost `cn.lastCatalog` (a ~6 KB model directory),
+    // `contextBudgets` and `enabled` — and the card then resolved the saved
+    // target model against the static fallback catalog, which does not contain
+    // it, reporting the model as withdrawn with testing disabled.
+    const { handler, mutateReceived, dispose } = await mountSaveRoutes()
+    const { res, status } = saveResponse()
+    await handler(saveReq({ field: 'regions', value: { cn: { pool: { enabled: true } } } }), res)
+    dispose()
+    expect(status()).toBe(200)
+    const ops = mutateReceived[0]?.[1] as Array<{ value: Record<string, unknown> }>
+    const value = ops[0]?.value as Record<string, unknown>
+    // The posted field wins...
+    expect(value).toMatchObject({ cn: { pool: { enabled: true } } })
+    // ...and everything it did not mention survives.
+    expect(value).toMatchObject({ cn: { enabled: true, contextBudgets: { 'glm-5.3': 1_000_000 } } })
+  })
+
+  it('still lets a caller CLEAR a field by sending it explicitly', async () => {
+    // The merge must not make a deliberate clear impossible: an explicit value,
+    // including an empty OBJECT, still wins over the stored one. Otherwise the
+    // fix for the deletion above would trap users with a selection they cannot
+    // remove.
+    //
+    // `lastCatalog` is deliberately NOT in this payload. An empty directory is
+    // not a clear — see the seeding tests below: `[]` is the incomplete shape
+    // issue #32 is about, and the endpoint repairs it instead of storing it.
+    const { handler, mutateReceived, dispose } = await mountSaveRoutes()
+    const { res } = saveResponse()
+    await handler(saveReq({
+      field: 'regions',
+      value: { cn: { enabled: false, contextBudgets: {}, enabledModelIds: [] } },
+    }), res)
+    dispose()
+    const ops = mutateReceived[0]?.[1] as Array<{ value: Record<string, unknown> }>
+    expect(ops[0]?.value).toMatchObject({
+      cn: { enabled: false, contextBudgets: {}, enabledModelIds: [] },
+    })
+  })
+
+  it('preserves omitted fields in the INTERNATIONAL region too', async () => {
+    // The merge keys off the FIELD's keys, not off a region name, so the fix is
+    // region-agnostic by construction. This pins that: a global pool save that
+    // mentions only `pool` must not delete the global model directory either.
+    //
+    // It matters more than the CN case, not less: the GLOBAL static fallback
+    // DOES contain the id the user had saved, so here the same deletion produced
+    // no visible symptom at all — a silent loss is the worse failure.
+    const { handler, mutateReceived, dispose } = await mountSaveRoutes({}, {
+      cn: { enabled: true },
+      global: {
+        enabled: true,
+        lastCatalog: [{ id: 'deepseek-v4.1-flash' }],
+        enabledModelIds: ['deepseek-v4.1-flash'],
+        contextBudgets: { 'gpt-5.5': 1_000_000 },
+      },
+    })
+    const { res, status } = saveResponse()
+    await handler(saveReq({ field: 'regions', value: { global: { pool: { enabled: true } } } }), res)
+    dispose()
+    expect(status()).toBe(200)
+    const ops = mutateReceived[0]?.[1] as Array<{ value: Record<string, unknown> }>
+    const value = ops[0]?.value as Record<string, unknown>
+    expect(value).toMatchObject({ global: { pool: { enabled: true } } })
+    expect(value).toMatchObject({
+      global: {
+        enabled: true,
+        lastCatalog: [{ id: 'deepseek-v4.1-flash' }],
+        enabledModelIds: ['deepseek-v4.1-flash'],
+        contextBudgets: { 'gpt-5.5': 1_000_000 },
+      },
+    })
+    // The region that was not saved keeps its own value untouched.
+    expect(value).toMatchObject({ cn: { enabled: true } })
+  })
+
+  it('does not turn an account-id string into an object', async () => {
+    // `accounts` values are account-id STRINGS, not slots. The slot merge keys
+    // off "both sides are plain records", so a string must pass through
+    // untouched — turning it into `{ 0: 'a' }` would corrupt every account
+    // selection.
+    const { handler, mutateReceived, dispose } = await mountSaveRoutes()
+    const { res } = saveResponse()
+    await handler(saveReq({ field: 'accounts', value: { cn: 'a' } }), res)
+    dispose()
+    const ops = mutateReceived[0]?.[1] as Array<{ value: Record<string, unknown> }>
+    expect(ops[0]?.value).toEqual({ cn: 'a' })
+  })
+
+  it('writes a CLEAN region map when the stored field was corrupted (restart reset)', async () => {
+    // THE END-TO-END SHAPE OF THAT BUG. The buggy catalog repair wrote the whole
+    // settings section into the `regions` field, which left `accounts` and
+    // `cliBridge` beside a nested `regions` map, and buried the international
+    // region one level down. A save that merges onto that raw field carries the
+    // wreckage forward forever; narrowing both sides first is what lets one save
+    // clean the document while still applying the posted preference.
+    const { handler, mutateReceived, dispose } = await mountSaveRoutes({}, {
+      accounts: { enabled: true },
+      regions: {
+        cn: { enabled: true, pool: { enabled: false } },
+        global: { enabled: true, pool: { enabled: true, memberAccountIds: ['g1', 'g2'] } },
+      },
+      cliBridge: { enabled: false },
+      cn: { enabled: true, pool: { enabled: true, memberAccountIds: ['m1'] } },
+    })
+    const { res, status } = saveResponse()
+    await handler(saveReq({ field: 'regions', value: { cn: { pool: { enabled: true, memberAccountIds: ['m1', 'm2'] } } } }), res)
+    dispose()
+    expect(status()).toBe(200)
+    const ops = mutateReceived[0]?.[1] as Array<{ value: Record<string, unknown> }>
+    const value = ops[0]?.value as Record<string, unknown>
+    // Only real regions at the top level: the sibling copies are gone.
+    expect(Object.keys(value).sort()).toEqual(['cn', 'global'])
+    // The posted preference landed on the surface slot…
+    expect(value).toMatchObject({ cn: { pool: { enabled: true, memberAccountIds: ['m1', 'm2'] } } })
+    // …and the international region survived, recovered from the buried copy.
+    expect(value).toMatchObject({ global: { pool: { enabled: true, memberAccountIds: ['g1', 'g2'] } } })
+  })
+
+  it('seeds a first save with the LIVE roster, never the static fallback (issue #32)', async () => {
+    // THE second half of #32. On a profile where #31 kept `regions` empty, the
+    // Host's resolved value is `{}`, so the very first save seeds `merged` with
+    // nothing but what the client posted. An unnamed slot then resolves its
+    // roster from the STATIC fallback (12 models), and `applySelection` writes
+    // that into the LIVE catalog — deleting every model only upstream knows
+    // about, including the one the agent was using, with no error anywhere.
+    //
+    // So a save must fill an empty slot from the live directory. `displayModels`
+    // here returns a roster the static fallback does NOT contain, which is what
+    // makes the assertion meaningful.
+    const live = [
+      { id: 'space-bunny', name: 'Space Bunny', contextWindow: 1_000_000, maxTokens: 48_000 },
+      { id: 'glm-5.3', name: 'GLM-5.3', contextWindow: 1_000_000, maxTokens: 48_000 },
+    ]
+    const { handler, mutateReceived, dispose } = await mountSaveRoutes(
+      { displayModels: () => live },
+      {},
+    )
+    const { res, status } = saveResponse()
+    await handler(saveReq({ field: 'regions', value: { cn: { imageModelIds: [] } } }), res)
+    dispose()
+    expect(status()).toBe(200)
+    const ops = mutateReceived[0]?.[1] as Array<{ value: Record<string, unknown> }>
+    const value = ops[0]?.value as Record<string, unknown>
+    // What the caller asked for...
+    expect(value).toMatchObject({ cn: { imageModelIds: [] } })
+    // ...plus the live roster, so the slot is no longer incomplete.
+    expect(value).toMatchObject({ cn: { lastCatalog: live } })
+  })
+
+  it('counts an EMPTY array as "no directory", so an incomplete slot is still filled (#32)', async () => {
+    // `lastCatalog: []` is the shape `regionStateConfig` defaults to, and it is
+    // indistinguishable from "no directory" for every reader. Treating it as a
+    // deliberate clear would leave the exact hole #32 is about.
+    const { handler, mutateReceived, dispose } = await mountSaveRoutes(
+      { displayModels: () => [{ id: 'space-bunny', name: 'Space Bunny', contextWindow: 1_000_000, maxTokens: 48_000 }] },
+      { cn: { enabled: true, lastCatalog: [], enabledModelIds: [] } },
+    )
+    const { res } = saveResponse()
+    await handler(saveReq({ field: 'regions', value: { cn: { enabledModelIds: ['space-bunny'] } } }), res)
+    dispose()
+    const ops = mutateReceived[0]?.[1] as Array<{ value: Record<string, unknown> }>
+    const value = ops[0]?.value as Record<string, unknown>
+    expect(value).toMatchObject({
+      cn: { lastCatalog: [{ id: 'space-bunny', name: 'Space Bunny', contextWindow: 1_000_000, maxTokens: 48_000 }] },
+    })
+  })
+
+  it('respects a caller that sends a real directory itself (#32)', async () => {
+    // The seed is a repair for an INCOMPLETE slot, not an override. When the
+    // client posts its own roster (the card does, from the refresh route) that
+    // value must win.
+    const posted = [{ id: 'auto', name: 'Auto', contextWindow: 168_000, maxTokens: 32_000 }]
+    const { handler, mutateReceived, dispose } = await mountSaveRoutes(
+      { displayModels: () => [{ id: 'space-bunny', name: 'Space Bunny', contextWindow: 1_000_000, maxTokens: 48_000 }] },
+      {},
+    )
+    const { res } = saveResponse()
+    await handler(saveReq({ field: 'regions', value: { cn: { lastCatalog: posted } } }), res)
+    dispose()
+    const ops = mutateReceived[0]?.[1] as Array<{ value: Record<string, unknown> }>
+    const value = ops[0]?.value as Record<string, unknown>
+    expect(value).toMatchObject({ cn: { lastCatalog: posted } })
+  })
+
+  it('does not touch a region the payload never mentioned (#32)', async () => {
+    // Only regions present in the payload are repaired: writing a sibling the
+    // caller was not saving would mutate settings this request was not about.
+    const { handler, mutateReceived, dispose } = await mountSaveRoutes(
+      { displayModels: region => region === 'global'
+        ? [{ id: 'default-model', name: 'Auto', contextWindow: 176_000, maxTokens: 24_000 }]
+        : [{ id: 'space-bunny', name: 'Space Bunny', contextWindow: 1_000_000, maxTokens: 48_000 }] },
+      { cn: { enabled: true, pool: { enabled: true } }, global: { enabled: true } },
+    )
+    const { res } = saveResponse()
+    await handler(saveReq({ field: 'regions', value: { cn: { contextBudgets: { 'glm-5.3': 1 } } } }), res)
+    dispose()
+    const ops = mutateReceived[0]?.[1] as Array<{ value: Record<string, unknown> }>
+    const value = ops[0]?.value as Record<string, unknown>
+    expect(value).toMatchObject({
+      cn: { lastCatalog: [{ id: 'space-bunny', name: 'Space Bunny', contextWindow: 1_000_000, maxTokens: 48_000 }] },
+    })
+    // `global` kept its stored shape instead of gaining a seeded directory.
+    expect(value).toMatchObject({ global: { enabled: true } })
+    expect((value['global'] as Record<string, unknown>)['lastCatalog']).toBeUndefined()
+  })
+
+  it('leaves the slot incomplete rather than writing an empty directory (#32)', async () => {
+    // If the live directory is itself empty there is nothing truthful to seed
+    // with. Writing `lastCatalog: []` would look like a completed save while
+    // changing nothing — the caller still gets what it asked for, nothing more.
+    const { handler, mutateReceived, dispose } = await mountSaveRoutes(
+      { displayModels: () => [] },
+      {},
+    )
+    const { res } = saveResponse()
+    await handler(saveReq({ field: 'regions', value: { cn: { enabledModelIds: [] } } }), res)
+    dispose()
+    const ops = mutateReceived[0]?.[1] as Array<{ value: Record<string, unknown> }>
+    const value = ops[0]?.value as Record<string, unknown>
+    expect(value).toEqual({ cn: { enabledModelIds: [] } })
+  })
+})
+
+/**
+ * The model probe route.
+ *
+ * A probe is a real request against a metered service, so the route's contract
+ * matters as much as its happy path: an empty list and an oversized list are
+ * both refused, and the batch runs SEQUENTIALLY — firing N requests at once is
+ * the surest way to create the very rate limit the probe exists to measure.
+ */
+describe('registerWorkBuddyStatusRoute probe route', () => {
+  interface CapturedEntry {
+    path: string
+    handler: (req: unknown, res: unknown) => Promise<void> | void
+  }
+
+  /** A request double carrying a JSON body, mimicking the node IncomingMessage. */
+  function probeReq(payload: unknown, url = '/plugins/dsh-connect-workbuddy/probe') {
+    const chunks = [Buffer.from(JSON.stringify(payload))]
+    return {
+      method: 'POST',
+      url,
+      headers: { origin: 'http://127.0.0.1' },
+      on: (ev: string, cb: (c: Buffer) => void) => {
+        if (ev === 'data') for (const c of chunks) cb(c)
+        if (ev === 'end') (cb as unknown as { (): void }).call(undefined)
+      },
+    }
+  }
+
+  function probeResponse(): {
+    res: { writeHead: (status: number, headers?: Record<string, string>) => void, end: (payload?: string) => void }
+    status: () => number
+    body: () => unknown
+  } {
+    let statusCode = 0
+    let payload = ''
+    return {
+      res: {
+        writeHead: (status: number) => { statusCode = status },
+        end: (body?: string) => { payload = body ?? '' },
+      },
+      status: () => statusCode,
+      body: () => JSON.parse(payload),
+    }
+  }
+
+  /** Mount the routes against a fake webServer, capturing handlers. */
+  async function mount(
+    options: Partial<WorkBuddyStatusRouteOptions>,
+    /** Drop the probe dependency entirely, to exercise the 503 branch. */
+    withoutProbe = false,
+  ): Promise<{
+    handler: CapturedEntry['handler']
+    seen: { region: string, modelIds: readonly string[] }[]
+  }> {
+    const captured: CapturedEntry[] = []
+    const seen: { region: string, modelIds: readonly string[] }[] = []
+    const FakeWebServer = {
+      name: 'webServer',
+      inject: [] as const,
+      apply(ctx: Context) {
+        ctx.provide('webServer', {
+          register: (entry: { path: string }) => {
+            captured.push(entry as CapturedEntry)
+            return () => {}
+          },
+        })
+      },
+    }
+    const ctx = new Context()
+    await ctx.plugin(FakeWebServer)
+    const { registerWorkBuddyStatusRoute } = await import('../src/web-status.ts')
+    registerWorkBuddyStatusRoute(ctx, deps({
+      ...withoutProbe ? {} : {
+        probeModels: async (region: WorkBuddyRegion, modelIds: readonly string[]) => {
+          seen.push({ region, modelIds })
+          return modelIds.map(modelId => ({ modelId, outcome: 'ok' as const, elapsedMs: 1 }))
+        },
+      },
+      ...options,
+    }))
+    await ctx.fiber.dispose()
+    const probe = captured.find(entry => entry.path === '/plugins/dsh-connect-workbuddy/probe')
+    if (probe === undefined) throw new Error('probe route was not registered')
+    return { handler: probe.handler, seen }
+  }
+
+  it('answers one result for the model it was given', async () => {
+    const { handler, seen } = await mount({})
+    const { res, status, body } = probeResponse()
+    await handler(probeReq({ modelIds: ['glm-5.3'] }), res)
+    expect(status()).toBe(200)
+    const results = (body() as { results: { modelId: string }[] }).results
+    expect(results.map(result => result.modelId)).toEqual(['glm-5.3'])
+    expect(seen).toEqual([{ region: 'cn', modelIds: ['glm-5.3'] }])
+  })
+
+  it('routes the region query to that region', async () => {
+    const { handler, seen } = await mount({})
+    const { res } = probeResponse()
+    await handler(probeReq({ modelIds: ['glm-5.3'] }, '/plugins/dsh-connect-workbuddy/probe?region=global'), res)
+    expect(seen[0]?.region).toBe('global')
+  })
+
+  it('refuses an empty model list instead of reporting a finished batch', async () => {
+    // An empty success would let the card render "done" for a batch that never
+    // ran, which is indistinguishable from a real all-clear.
+    const { handler } = await mount({})
+    const { res, status } = probeResponse()
+    await handler(probeReq({ modelIds: [] }), res)
+    expect(status()).toBe(400)
+  })
+
+  it('refuses a non-array model list', async () => {
+    const { handler } = await mount({})
+    const { res, status } = probeResponse()
+    await handler(probeReq({ modelIds: 'glm-5.3' }), res)
+    expect(status()).toBe(400)
+  })
+
+  it('accepts a single-model probe, which is the only shape the card sends', async () => {
+    const { handler, seen } = await mount({})
+    const { res, status } = probeResponse()
+    await handler(probeReq({ modelIds: ['glm-5.3'] }), res)
+    expect(status()).toBe(200)
+    expect(seen).toEqual([{ region: 'cn', modelIds: ['glm-5.3'] }])
+  })
+
+  it('refuses a probe naming more than one model', async () => {
+    // THE cost guard. Every probe sends a real-volume request and costs real
+    // credits (measured 0.72 each), so a roster-wide sweep from one click would
+    // be a large uncontrolled spend. The card only ever names one model, so a
+    // multi-model request is not the card — refuse it rather than serve it.
+    const { handler, seen } = await mount({})
+    const { res, status } = probeResponse()
+    await handler(probeReq({ modelIds: ['glm-5.3', 'hy3'] }), res)
+    expect(status()).toBe(400)
+    expect(seen).toEqual([])
+  })
+
+  it('answers 503 when the host offers no probe capability', async () => {
+    const { handler } = await mount({}, true)
+    const { res, status } = probeResponse()
+    await handler(probeReq({ modelIds: ['glm-5.3'] }), res)
+    expect(status()).toBe(503)
+  })
+
+  it('refuses a non-loopback origin', async () => {
+    const { handler } = await mount({})
+    const { res, status } = probeResponse()
+    await handler({
+      method: 'POST',
+      url: '/plugins/dsh-connect-workbuddy/probe',
+      headers: { origin: 'http://evil.example' },
+      on: () => {},
+    }, res)
+    expect(status()).toBe(403)
+  })
+
+  it('refuses a non-POST method', async () => {
+    const { handler } = await mount({})
+    const { res, status } = probeResponse()
+    await handler({ method: 'GET', url: '/plugins/dsh-connect-workbuddy/probe', headers: {}, on: () => {} }, res)
+    expect(status()).toBe(405)
+  })
+
+  it('refuses an unknown region rather than guessing', async () => {
+    const { handler } = await mount({})
+    const { res, status } = probeResponse()
+    await handler(probeReq({ modelIds: ['glm-5.3'] }, '/plugins/dsh-connect-workbuddy/probe?region=mars'), res)
+    expect(status()).toBe(400)
+  })
+
+  it('reports a thrown probe as a 500 without leaking a token', async () => {
+    const { handler } = await mount({
+      probeModels: async () => {
+        throw new Error('upstream said access_token=supersecretvalue')
+      },
+    })
+    const { res, status, body } = probeResponse()
+    await handler(probeReq({ modelIds: ['glm-5.3'] }), res)
+    expect(status()).toBe(500)
+    expect(JSON.stringify(body())).not.toContain('supersecretvalue')
+  })
+})
+
+/**
+ * The client↔host URL contract.
+ *
+ * Every route that dispatches on `action` answers 400 when the parameter is
+ * absent, so the client must build the URL with an action. This was the gap
+ * that let the OAuth and transfer features ship dead: both components built
+ * their URLs with `withWorkBuddyRegion` (region only, no action), so every
+ * request 400'd. The existing route tests could not see it because they
+ * hand-build URLs that already carry `action=` — nothing asserted that the
+ * URL the CLIENT constructs is one the HOST accepts.
+ *
+ * These tests close that gap by driving the real client-side helper and the
+ * real host-side parser against each other. The source guard below additionally
+ * fails if a caller regresses to the region-only builder.
+ */
+describe('client → host action contract', () => {
+  const builders: ReadonlyArray<readonly [name: string, url: string, expected: string]> = [
+    ['transfer export', withWorkBuddyRouteAction(WORKBUDDY_TRANSFER_PATH, 'cn', 'export'), 'export'],
+    ['transfer preview', withWorkBuddyRouteAction(WORKBUDDY_TRANSFER_PATH, 'cn', 'preview'), 'preview'],
+    ['transfer import', withWorkBuddyRouteAction(WORKBUDDY_TRANSFER_PATH, 'cn', 'import'), 'import'],
+    ['oauth start', withWorkBuddyRouteAction(WORKBUDDY_OAUTH_PATH, 'global', 'start'), 'start'],
+    ['oauth poll', withWorkBuddyRouteAction(WORKBUDDY_OAUTH_PATH, 'global', 'poll'), 'poll'],
+  ]
+
+  it('every URL the client builds is one the host accepts', () => {
+    for (const [name, url, expected] of builders) {
+      const parsed = url.includes('oauth')
+        ? oauthActionOf(url)
+        : transferActionOf(url)
+      expect(parsed, `${name}: ${url} must carry a parsable action`).toBe(expected)
+      // The region must survive alongside the action, or the request would
+      // address the wrong provider stack.
+      expect(url).toContain('region=')
+    }
+  })
+
+  it('the region-only builder is never used for an action-dispatching route', () => {
+    // Source guard: catches a caller reintroducing the omission, which the
+    // behavioural test above cannot see if that caller is never exercised.
+    for (const file of ['AccountTransfer.tsx', 'OAuthSignIn.tsx']) {
+      const source = readFileSync(new URL(`../src/client/${file}`, import.meta.url), 'utf8')
+      expect(source, `${file} must not call withWorkBuddyRegion on an action route`)
+        .not.toMatch(/withWorkBuddyRegion\(\s*WORKBUDDY_(TRANSFER|OAUTH)_PATH/)
+    }
+  })
+})
+
+describe('the CodeBuddy-CLI switch rides on the status answer', () => {
+  /** A store that is signed out, which is the cheapest branch to build. */
+  const signedOut = () => ({
+    accounts: async () => [],
+    status: async () => ({ state: 'signed-out' as const }),
+    resolve: async () => { throw new Error('no account') },
+    selectionLost: async () => false,
+    hasExplicitSelection: () => false,
+  })
+
+  it('reports OFF when the Host cannot answer', async () => {
+    // Absent must read as OFF: this switch authorizes a child process that edits
+    // files and spends CodeBuddy quota, so silence is not consent.
+    const status = await workBuddyWebStatus(deps({ store: () => signedOut() as never }), 'cn')
+    expect((status as { cliBridgeEnabled?: boolean }).cliBridgeEnabled).toBe(false)
+  })
+
+  it('reports the committed switch', async () => {
+    const status = await workBuddyWebStatus(deps({ store: () => signedOut() as never, cliBridgeEnabled: () => true }), 'cn')
+    expect((status as { cliBridgeEnabled?: boolean }).cliBridgeEnabled).toBe(true)
+  })
+
+  it('is GLOBAL: both regions carry the same value', async () => {
+    const build = () => deps({ store: () => signedOut() as never, cliBridgeEnabled: () => true })
+    const cn = await workBuddyWebStatus(build(), 'cn')
+    const intl = await workBuddyWebStatus(build(), 'global')
+    expect((cn as { cliBridgeEnabled?: boolean }).cliBridgeEnabled).toBe(true)
+    expect((intl as { cliBridgeEnabled?: boolean }).cliBridgeEnabled).toBe(true)
+  })
+})

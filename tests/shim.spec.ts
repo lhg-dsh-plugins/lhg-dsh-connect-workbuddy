@@ -1,0 +1,583 @@
+import { afterEach, describe, expect, it } from 'vitest'
+import { createServer, type Server } from 'node:http'
+import type { AddressInfo } from 'node:net'
+import { WorkBuddyCatalog } from '../src/catalog.ts'
+import { clientRefusesPort, createWorkBuddyShim, isBadPortRefusal, listenOnClientReachablePort, PORT_ROLL_LIMIT } from '../src/shim.ts'
+import type { WorkBuddyShim } from '../src/shim.ts'
+import type { WorkBuddyCredential } from '../src/auth.ts'
+import { parseUpstreamErrorDetail } from '../src/upstream.ts'
+import type { WorkBuddyChatResult } from '../src/upstream.ts'
+
+let shim: WorkBuddyShim | undefined
+afterEach(async () => { await shim?.close(); shim = undefined })
+
+const CREDENTIAL: WorkBuddyCredential = {
+  accessToken: 'access',
+  refreshToken: 'refresh',
+  expiresAtMs: Date.now() + 86_400_000,
+  domain: 'www.codebuddy.cn',
+  uid: 'uid',
+  source: 'desktop',
+  filePath: '/tmp/auth.info',
+}
+
+const POLICY_REJECT_BODY = JSON.stringify({
+  code: 11140,
+  msg: 'request illegal',
+  requestId: '3498bf50-98a9-4746-962e-c14016b8c578',
+  displayMsg: {
+    en: 'The content did not pass the safety review. Please adjust and retry.',
+    zh: '内容未通过安全审核，请调整后重试。',
+  },
+  actions: ['SUBMIT_FEEDBACK', 'COPY_ERROR', 'EDIT_INPUT'],
+})
+
+const store = {
+  resolve: async () => CREDENTIAL,
+} as unknown as import('../src/auth.ts').WorkBuddyCredentialStore
+
+/** Loosely-typed client: tests supply only the one method the shim calls. */
+type TestClient = {
+  chatStream: (credential: WorkBuddyCredential, body: string, signal?: AbortSignal) => Promise<WorkBuddyChatResult>
+}
+
+function makeShim(client: Partial<TestClient> & Record<string, unknown>): WorkBuddyShim {
+  return createWorkBuddyShim({
+    store,
+    client: client as unknown as import('../src/upstream.ts').WorkBuddyUpstreamClient,
+    catalog: new WorkBuddyCatalog(),
+  })
+}
+
+/**
+ * Send a raw HTTP request so the Host header is fully under test control.
+ *
+ * `fetch` derives the Host header from the URL and ignores attempts to set
+ * it, so a DNS-rebinding simulation (attacker domain in Host) needs a raw
+ * socket write.
+ */
+async function rawRequest(
+  shim: WorkBuddyShim,
+  options: { method?: string; path?: string; host?: string; headers?: Record<string, string>; body?: string },
+): Promise<{ status: number; body: string }> {
+  const { connect } = await import('node:net')
+  const url = new URL(shim.baseUrl())
+  const method = options.method ?? 'GET'
+  const path = options.path ?? '/healthz'
+  const host = options.host ?? `${url.hostname}:${url.port}`
+  const extra = Object.entries(options.headers ?? {})
+    .map(([key, value]) => `${key}: ${value}`)
+    .join('\r\n')
+  const body = options.body ?? ''
+  const payload = [
+    `${method} ${path} HTTP/1.1`,
+    `Host: ${host}`,
+    ...extra === '' ? [] : [extra],
+    ...body === '' ? [] : ['Content-Length: ' + Buffer.byteLength(body)],
+    'Connection: close',
+    '',
+    '',
+  ].join('\r\n') + body
+
+  return await new Promise((resolve, reject) => {
+    const socket = connect({ host: url.hostname, port: Number(url.port) })
+    let raw = ''
+    socket.setTimeout(5000, () => { socket.destroy(); reject(new Error('shim request timed out')) })
+    socket.on('error', reject)
+    socket.on('data', chunk => { raw += String(chunk) })
+    socket.on('close', () => {
+      const [head = '', ...rest] = raw.split('\r\n\r\n')
+      const statusLine = head.split('\r\n')[0] ?? ''
+      const match = /HTTP\/1\.1\s+(\d+)/.exec(statusLine)
+      resolve({ status: match === null ? 0 : Number(match[1]), body: rest.join('\r\n\r\n') })
+    })
+    socket.write(payload)
+  })
+}
+
+/** Call the shim the way its own in-process client does. */
+async function request(
+  shim: WorkBuddyShim,
+  init: { method?: string; path?: string; headers?: Record<string, string>; body?: string },
+): Promise<{ status: number; body: string }> {
+  const response = await fetch(`${shim.baseUrl()}${init.path ?? '/healthz'}`, {
+    method: init.method ?? 'GET',
+    headers: init.headers ?? {},
+    ...init.body === undefined ? {} : { body: init.body },
+  })
+  return { status: response.status, body: await response.text() }
+}
+
+async function authed(shim: WorkBuddyShim, extra: Record<string, string> = {}): Promise<Record<string, string>> {
+  return { authorization: `Bearer ${shim.token()}`, ...extra }
+}
+
+describe('shim inbound hardening', () => {
+  it('rejects a non-loopback Host header (DNS-rebinding simulation)', async () => {
+    shim = makeShim({ chatStream: async () => ({ ok: true, response: new Response('') }) })
+    await shim.ready
+    // A rebinding page reaches 127.0.0.1 but sends its own domain in Host.
+    const response = await rawRequest(shim, { host: 'evil.example.com' })
+    expect(response.status).toBe(403)
+    expect(response.body).toContain('host_not_allowed')
+  })
+
+  it('accepts an explicit loopback Host header', async () => {
+    shim = makeShim({ chatStream: async () => ({ ok: true, response: new Response('') }) })
+    await shim.ready
+    const response = await rawRequest(shim, {
+      host: '127.0.0.1',
+      headers: { authorization: `Bearer ${shim.token()}` },
+    })
+    expect(response.status).toBe(200)
+  })
+
+  it('rejects a cross-origin browser Origin', async () => {
+    shim = makeShim({ chatStream: async () => ({ ok: true, response: new Response('') }) })
+    await shim.ready
+    const response = await request(shim, { headers: { origin: 'https://evil.example.com' } })
+    expect(response.status).toBe(403)
+    expect(response.body).toContain('origin_not_allowed')
+  })
+
+  it('rejects a missing or wrong bearer', async () => {
+    shim = makeShim({ chatStream: async () => ({ ok: true, response: new Response('') }) })
+    await shim.ready
+    expect((await request(shim, {})).status).toBe(401)
+    const wrong = await request(shim, { headers: { authorization: 'Bearer wrong-secret' } })
+    expect(wrong.status).toBe(401)
+  })
+
+  it('serves healthz and the model list to its own client', async () => {
+    shim = makeShim({ chatStream: async () => ({ ok: true, response: new Response('') }) })
+    await shim.ready
+    const health = await request(shim, { headers: await authed(shim) })
+    expect(health.status).toBe(200)
+    const models = await request(shim, { path: '/v1/models', headers: await authed(shim) })
+    expect(models.status).toBe(200)
+    const listed = JSON.parse(models.body) as { data: { id: string }[] }
+    expect(listed.data.length).toBeGreaterThan(0)
+  })
+
+  it('requires a JSON content type for chat completions', async () => {
+    shim = makeShim({ chatStream: async () => ({ ok: true, response: new Response('') }) })
+    await shim.ready
+    const response = await request(shim, {
+      method: 'POST',
+      path: '/v1/chat/completions',
+      headers: await authed(shim, { 'content-type': 'text/plain' }),
+      body: '{}',
+    })
+    expect(response.status).toBe(415)
+  })
+
+  it('maps upstream credit exhaustion to HTTP 402', async () => {
+    shim = makeShim({
+      chatStream: async () => ({ ok: false, status: 400, kind: 'hard_credit', message: '积分不足' }),
+    })
+    await shim.ready
+    const response = await request(shim, {
+      method: 'POST',
+      path: '/v1/chat/completions',
+      headers: await authed(shim, { 'content-type': 'application/json' }),
+      body: JSON.stringify({ model: 'glm-5.3', messages: [] }),
+    })
+    expect(response.status).toBe(402)
+    expect(response.body).toContain('hard_credit')
+  })
+
+  it('reports a 11140 policy rejection as 403 with the server message, not a 400 client error', async () => {
+    shim = makeShim({
+      chatStream: async () => ({
+        ok: false,
+        status: 403,
+        kind: 'policy_reject',
+        message: POLICY_REJECT_BODY,
+        detail: parseUpstreamErrorDetail(POLICY_REJECT_BODY),
+      }),
+    })
+    await shim.ready
+    const response = await request(shim, {
+      method: 'POST',
+      path: '/v1/chat/completions',
+      headers: await authed(shim, { 'content-type': 'application/json' }),
+      body: JSON.stringify({ model: 'glm-5.3', messages: [] }),
+    })
+    expect(response.status).toBe(403)
+    const parsed = JSON.parse(response.body) as { error: { message: string; type: string; code: string } }
+    expect(parsed.error.type).toBe('policy_reject')
+    // `code` names the CLASS, not the upstream's numeric 11140: the host routes
+    // on a stable machine-readable class and 11140 is not one it knows, so
+    // passing it through would only push the failure down the host's generic
+    // path. What must hold is the property below — a policy refusal must not be
+    // retried in place — and the class name is how that is expressed.
+    expect(parsed.error.code).toBe('policy_reject')
+    expect(parsed.error.message).toContain('内容未通过安全审核，请调整后重试。')
+    expect(parsed.error.message).toContain('3498bf50-98a9-4746-962e-c14016b8c578')
+    expect(parsed.error.message).toContain('服务端策略拒绝')
+  })
+
+  it('does not hand the host a policy refusal as a retryable or quota code', async () => {
+    // The property the `code` choice above exists to protect. A content-policy
+    // refusal is deterministic: the server will refuse the same input again, so
+    // the host must neither retry it in place nor read it as a quota/auth issue.
+    shim = makeShim({
+      chatStream: async () => ({
+        ok: false,
+        status: 403,
+        kind: 'policy_reject',
+        message: POLICY_REJECT_BODY,
+        detail: parseUpstreamErrorDetail(POLICY_REJECT_BODY),
+      }),
+    })
+    await shim.ready
+    const response = await request(shim, {
+      method: 'POST',
+      path: '/v1/chat/completions',
+      headers: await authed(shim, { 'content-type': 'application/json' }),
+      body: JSON.stringify({ model: 'glm-5.3', messages: [] }),
+    })
+    const parsed = JSON.parse(response.body) as { error: { message: string; type: string; code: string } }
+    // Asserted against the HOST's own classifier rather than a copy of its
+    // rules: a copied regex only proves the two copies agree today.
+    const { isQuotaExceededError } = await import('@deepseek-ai/dsh-llm')
+    expect(isQuotaExceededError(`${parsed.error.type} ${parsed.error.code}`)).toBe(false)
+    expect(isQuotaExceededError(`${parsed.error.type} ${parsed.error.code} ${parsed.error.message}`)).toBe(false)
+  })
+
+  it('maps a dead session to HTTP 401 and a rate limit to 429', async () => {
+    const cases: [import('../src/upstream.ts').UpstreamErrorKind, number][] = [
+      ['session_dead', 401],
+      ['soft_rate', 429],
+      ['server', 502],
+      ['policy_reject', 403],
+    ]
+    for (const [kind, expected] of cases) {
+      shim = makeShim({ chatStream: async () => ({ ok: false, status: 500, kind, message: 'x' }) })
+      await shim.ready
+      const response = await request(shim, {
+        method: 'POST',
+        path: '/v1/chat/completions',
+        headers: await authed(shim, { 'content-type': 'application/json' }),
+        body: '{}',
+      })
+      expect(response.status).toBe(expected)
+      await shim.close()
+    }
+    shim = undefined
+  })
+
+  /**
+   * The `code` an upstream failure is written back with decides whether the HOST
+   * retries in place or hands the turn to cross-provider failover — so these
+   * assert the wire body, not just the HTTP status the test above covers.
+   *
+   * The assertion that matters is the one at the bottom: it runs the HOST'S OWN
+   * classifier (`isQuotaExceededError`, imported from `@deepseek-ai/dsh-llm`)
+   * over the exact string this shim produces. Retyping the regex here would
+   * prove only that two copies of it agree today.
+   */
+  it('writes a quota code the host classifies as terminal, not as a rate limit', async () => {
+    shim = makeShim({ chatStream: async () => ({ ok: false, status: 429, kind: 'soft_rate', message: '用量超限' }) })
+    await shim.ready
+    const response = await request(shim, {
+      method: 'POST',
+      path: '/v1/chat/completions',
+      headers: await authed(shim, { 'content-type': 'application/json' }),
+      body: '{}',
+    })
+
+    expect(response.status).toBe(429)
+    const body = JSON.parse(response.body) as { error: { type: string, code: string, message: string } }
+    // `type` stays the plugin's own kind — it is what a human reads in a log.
+    expect(body.error.type).toBe('soft_rate')
+    expect(body.error.code).toBe('quota_exceeded')
+    // The upstream's own words still reach the reader.
+    expect(body.error.message).toContain('用量超限')
+
+    // The claim, checked against the host's real rule rather than a copy of it.
+    const { isQuotaExceededError } = await import('@deepseek-ai/dsh-llm')
+    expect(isQuotaExceededError(`${body.error.type} ${body.error.code}`)).toBe(true)
+    // …and the spelling it replaced would NOT have been, which is the whole bug.
+    expect(isQuotaExceededError('soft_rate soft_rate')).toBe(false)
+  })
+
+  it('leaves every other upstream kind spelled as its own kind', async () => {
+    // Only `soft_rate` moves: `hard_credit` is 402 (quota by status anyway) and
+    // the rest already land outside the host's retry set. A translation nobody
+    // needs is a lie waiting to drift.
+    //
+    // `model_busy` is in this list precisely BECAUSE issue #84: it used to be
+    // translated onto `quota_exceeded`, which the host reads as an exhausted
+    // balance and answers by replacing the message with 「当前请求的额度已用尽」.
+    // See the test below for the classification that matters.
+    for (const kind of ['hard_credit', 'model_busy', 'session_dead', 'server', 'not_found', 'client'] as const) {
+      shim = makeShim({ chatStream: async () => ({ ok: false, status: 500, kind, message: 'x' }) })
+      await shim.ready
+      const response = await request(shim, {
+        method: 'POST',
+        path: '/v1/chat/completions',
+        headers: await authed(shim, { 'content-type': 'application/json' }),
+        body: '{}',
+      })
+      const body = JSON.parse(response.body) as { error: { type: string, code: string } }
+      expect([kind, body.error.code]).toEqual([kind, kind])
+      await shim.close()
+    }
+    shim = undefined
+  })
+
+  it('does not disguise the shim\'s own errors as upstream quota failures', async () => {
+    // `writeOpenAIError` serves both paths; only the upstream one translates.
+    // A 401 with no credential, or a 404 route, must stay themselves — telling
+    // the host "quota exceeded" about our own bug would send it to failover
+    // over an error no other provider can fix.
+    const { isQuotaExceededError } = await import('@deepseek-ai/dsh-llm')
+
+    shim = makeShim({ chatStream: async () => ({ ok: true, response: new Response('') }) })
+    await shim.ready
+    const unauthorised = await request(shim, { method: 'POST', path: '/v1/chat/completions', body: '{}' })
+    expect(unauthorised.status).toBe(401)
+    const unauthorisedBody = JSON.parse(unauthorised.body) as { error: { type: string, code: string } }
+    expect(unauthorisedBody.error.type).toBe('unauthorized')
+    expect(unauthorisedBody.error.code).toBe('unauthorized')
+    expect(isQuotaExceededError(`${unauthorisedBody.error.type} ${unauthorisedBody.error.code}`)).toBe(false)
+
+    const missing = await request(shim, {
+      method: 'GET',
+      path: '/v1/nope',
+      headers: await authed(shim),
+    })
+    expect(missing.status).toBe(404)
+    const missingBody = JSON.parse(missing.body) as { error: { type: string, code: string } }
+    expect(missingBody.error.code).toBe('not_found')
+  })
+
+  it('never forwards the caller\'s bearer to the upstream', async () => {
+    let seenAuth: string | undefined
+    const local = makeShim({
+      chatStream: async (credential: WorkBuddyCredential) => {
+        seenAuth = credential.accessToken
+        return { ok: true, response: new Response('data: [DONE]\n\n') }
+      },
+    })
+    shim = local
+    await local.ready
+    await request(local, {
+      method: 'POST',
+      path: '/v1/chat/completions',
+      headers: await authed(local, { 'content-type': 'application/json' }),
+      body: '{}',
+    })
+    // The shim must resolve the real credential from its store, not pass
+    // through the per-process secret the caller presented.
+    expect(seenAuth).toBe(CREDENTIAL.accessToken)
+    expect(seenAuth).not.toBe(local.token())
+  })
+
+  it('reports a signed-out store as 401 rather than leaking a stack', async () => {
+    const failing = createWorkBuddyShim({
+      store: { resolve: async () => { throw new Error('workbuddy: no signed-in account') } } as never,
+      client: { chatStream: async () => ({ ok: true, response: new Response('') }) } as never,
+      catalog: new WorkBuddyCatalog(),
+    })
+    shim = failing
+    await failing.ready
+    const response = await request(failing, {
+      method: 'POST',
+      path: '/v1/chat/completions',
+      headers: await authed(failing, { 'content-type': 'application/json' }),
+      body: '{}',
+    })
+    expect(response.status).toBe(401)
+    expect(response.body).toContain('not_signed_in')
+  })
+})
+
+describe('shim lifecycle', () => {
+  it('binds a loopback port and closes cleanly', async () => {
+    const local = makeShim({ chatStream: async () => ({ ok: true, response: new Response('') }) })
+    await local.ready
+    expect(local.baseUrl()).toMatch(/^http:\/\/127\.0\.0\.1:\d+$/)
+    expect(local.token().length).toBeGreaterThan(20)
+    await local.close()
+  })
+
+  it('uses a distinct secret per instance', async () => {
+    const a = makeShim({ chatStream: async () => ({ ok: true, response: new Response('') }) })
+    const b = makeShim({ chatStream: async () => ({ ok: true, response: new Response('') }) })
+    await Promise.all([a.ready, b.ready])
+    expect(a.token()).not.toBe(b.token())
+    await a.close()
+    await b.close()
+  })
+
+  it('settles ready and close when disposed before the listener is up', async () => {
+    // The port-roll change made `ready` an async chain over repeated binds,
+    // which widened the window in which a dispose can land mid-startup. That
+    // window has teeth: measured on Node 24, a `close()` during a pending
+    // `listen()` fires NEITHER `listening` nor `error` — so a `ready` that only
+    // watched those two would stay pending forever, and plugin unload awaits it.
+    const local = makeShim({ chatStream: async () => ({ ok: true, response: new Response('') }) })
+    await local.close()
+    await expect(local.ready).resolves.toBeUndefined()
+  })
+
+  it('tolerates concurrent close calls', async () => {
+    const local = makeShim({ chatStream: async () => ({ ok: true, response: new Response('') }) })
+    await local.ready
+    await Promise.all([local.close(), local.close(), local.close()])
+  })
+})
+
+/**
+ * The port the kernel hands `listen(0)` is not always one the HTTP client will
+ * talk to.
+ *
+ * The Fetch standard bans a list of ports that `fetch` must refuse BEFORE it
+ * opens a socket (`fetch.spec.whatwg.org#block-bad-port`), and every client of
+ * this shim reaches it through that same `fetch` — pi-ai drives the OpenAI SDK,
+ * whose `getDefaultFetch()` returns `globalThis.fetch`. A shim that lands on a
+ * banned port is therefore unreachable to its own client while remaining
+ * perfectly healthy on the wire.
+ *
+ * Whether that is possible depends on the machine's dynamic port range, since
+ * that is the set `listen(0)` draws from. On the platform defaults every banned
+ * port (the list currently ends at 10080) sits BELOW the range, so the
+ * intersection is empty and nothing can go wrong. It stops being empty when the
+ * range is lowered to reach under 10080 — the legacy `MaxUserPort` registry
+ * value is one way, and at 15000 it yields 1024-15000, which contains 19 banned
+ * ports (~0.14% per bind, ~0.27% per plugin load with two regions).
+ *
+ * These tests run everywhere, including on the machines that cannot be
+ * affected, because the behaviour they pin is exactly what keeps a machine that
+ * CAN be affected from silently failing.
+ */
+describe('client-reachable port binding', () => {
+  /**
+   * Whether this runtime's client refuses `port`, asked the same way the shim
+   * asks it. Asserted rather than assumed so this file fails loudly if a future
+   * Node renames the error instead of quietly losing the guard.
+   */
+  const refusedDirectly = (port: number): Promise<boolean> => clientRefusesPort(port)
+
+  it('detects a banned port as refused, through the real client', async () => {
+    // 6000 is on the banned list; 10080 is its highest entry. Both are asserted
+    // because a check that only ever sees low numbers would still pass if the
+    // rule it relies on silently stopped covering the top of the range.
+    expect(await refusedDirectly(6000)).toBe(true)
+    expect(await refusedDirectly(10080)).toBe(true)
+  })
+
+  it('does not mistake a healthy listener port for a refused one', async () => {
+    // The load-bearing half: without it, a stub that always answered "refused"
+    // would make the re-roll test below pass while breaking every normal start.
+    const local = makeShim({ chatStream: async () => ({ ok: true, response: new Response('') }) })
+    await local.ready
+    const port = Number(new URL(local.baseUrl()).port)
+    expect(await refusedDirectly(port)).toBe(false)
+    await local.close()
+  })
+
+  it('recognises the refusal only when the client refused the port', async () => {
+    // Distinguishing the two is the whole point of the classifier: a refused
+    // port is worth re-rolling, whereas a genuine transport error is not, and
+    // re-rolling on one would mask a real failure.
+    const listener = createServer()
+    await new Promise<void>(resolve => listener.listen(0, '127.0.0.1', () => resolve()))
+    const port = (listener.address() as AddressInfo).port
+    await new Promise<void>(resolve => listener.close(() => resolve()))
+
+    let transportError: unknown
+    try {
+      await fetch(`http://127.0.0.1:${port}/healthz`)
+    } catch (error: unknown) {
+      transportError = error
+    }
+    expect(transportError).toBeDefined()
+    // A closed port is a real connection failure, not the client's port refusal.
+    expect(isBadPortRefusal(transportError)).toBe(false)
+
+    // And the shape the classifier keys on is pinned here, so a Node change
+    // that renames it turns this red rather than silently disabling the guard.
+    let bannedError: unknown
+    try {
+      await fetch('http://127.0.0.1:6000/healthz')
+    } catch (error: unknown) {
+      bannedError = error
+    }
+    expect((bannedError as { cause?: { message?: string } }).cause?.message).toBe('bad port')
+    expect(isBadPortRefusal(bannedError)).toBe(true)
+  })
+
+  it('re-rolls off a refused port and serves on the next one', async () => {
+    // The regression this whole change exists for. `listen(0)` cannot be made
+    // to return a banned port on demand, so the client's answer is injected:
+    // the first settled port is reported refused, and binding must continue
+    // until a port is accepted. Without the re-roll, `ready` resolves on the
+    // refused port and every request through the shim fails.
+    const server = createServer((_req, res) => { res.writeHead(200); res.end('ok') })
+    const seen: number[] = []
+    await listenOnClientReachablePort({
+      server,
+      clientRefuses: async port => {
+        seen.push(port)
+        // Refuse only the first port, whatever it happens to be.
+        return seen.length === 1
+      },
+    })
+
+    const address = server.address() as AddressInfo
+    expect(seen.length).toBe(2)
+    expect(seen[0]).not.toBe(seen[1])
+    expect(address.port).toBe(seen[1])
+    // Serving for real, not merely bound.
+    const response = await fetch(`http://127.0.0.1:${address.port}/healthz`)
+    expect(response.status).toBe(200)
+    await new Promise<void>(resolve => server.close(() => resolve()))
+  })
+
+  it('stops re-rolling instead of spinning when no port satisfies the client', async () => {
+    // A machine whose whole range were refused must still come up: serving on a
+    // refused port fails in ONE region-scoped way, while no shim at all takes
+    // the region down outright. The bound is what keeps that from being an
+    // infinite loop.
+    const server = createServer((_req, res) => { res.writeHead(200); res.end('ok') })
+    const warnings: string[] = []
+    let rolls = 0
+    await listenOnClientReachablePort({
+      server,
+      clientRefuses: async () => { rolls++; return true },
+      logger: { warn: (...args: unknown[]) => { warnings.push(String(args[0])) }, error: () => {} },
+    })
+
+    expect(rolls).toBe(PORT_ROLL_LIMIT)
+    expect(warnings.some(line => line.includes('serving on it anyway'))).toBe(true)
+    // Still listening, so the region degrades rather than disappearing.
+    expect(server.address()).not.toBeNull()
+    await new Promise<void>(resolve => server.close(() => resolve()))
+  })
+
+  it('does not re-roll at all when the first port is accepted', async () => {
+    // The common path on every platform default: one bind, one probe, no
+    // warning. Guards against a re-roll that fires unconditionally.
+    const server = createServer()
+    const warnings: string[] = []
+    let rolls = 0
+    await listenOnClientReachablePort({
+      server,
+      clientRefuses: async () => { rolls++; return false },
+      logger: { warn: (...args: unknown[]) => { warnings.push(String(args[0])) }, error: () => {} },
+    })
+
+    expect(rolls).toBe(1)
+    expect(warnings).toEqual([])
+    await new Promise<void>(resolve => server.close(() => resolve()))
+  })
+})
+
+// Guard against leaking a listening server between tests.
+afterEach(() => {
+  const servers = (globalThis as { __wbServers?: Server[] }).__wbServers
+  void servers
+})

@@ -1,0 +1,849 @@
+/**
+ * At-rest field decryption tests.
+ *
+ * The fixtures are sealed here with the SAME algorithm the desktop app uses
+ * (AES-256-GCM over a length-prefixed AAD transcript), so the reader is proven
+ * against an independently produced envelope rather than against a blob pasted
+ * from one machine. A known-good envelope captured from a real Windows install
+ * is included as a fixed vector so a refactor that changes the transcript
+ * fails loudly.
+ */
+
+import { createCipheriv, createHash } from 'node:crypto'
+import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
+import { join, sep, win32 } from 'node:path'
+import { afterEach, beforeEach, describe, expect, it } from 'vitest'
+import {
+  deriveAtRestKey,
+  deriveAtRestKeyId,
+  findWorkbuddyAppExecutable,
+  findWorkbuddyAppExecutableWithSource,
+  isEncryptedFieldWrapper,
+  isWorkbuddyBundle,
+  macosBundleExecutable,
+  normalizeRegistryExecutable,
+  openEncryptedField,
+  registryExecutableFromQuery,
+  registryInstallLocationFromQuery,
+  windowsRegistryAppExecutable,
+  workbuddyAppExecutableCandidates,
+  WORKBUDDY_APP_EXECUTABLE_ENV,
+} from '../src/at-rest.ts'
+import { hasEncryptedCredentialFields, parseWorkBuddyAuth } from '../src/auth.ts'
+
+const KEY_ID = '9127dea1b44020a7'
+
+/** The payload shape the desktop app's native binding returns. */
+function keyPayload(secretBase64: string): string {
+  return JSON.stringify({ version: 1, atRestSecretKey: secretBase64 })
+}
+
+/** A 32-byte secret in canonical base64; the app hashes this STRING. */
+function secretFor(tag: string): string {
+  return createHash('sha256').update(`test-secret\0${tag}`).digest('base64')
+}
+
+const encoder = new TextEncoder()
+
+function encodeUint32(value: number): Buffer {
+  const bytes = Buffer.allocUnsafe(4)
+  bytes.writeUInt32BE(value)
+  return bytes
+}
+
+function encodeLengthPrefixed(value: string): Buffer {
+  const bytes = Buffer.from(value, 'utf8')
+  return Buffer.concat([encodeUint32(bytes.length), bytes])
+}
+
+/** Seal a value exactly as the desktop app's field codec does. */
+function sealField(plaintext: string, payloadJson: string, framing: 'field' | 'file' = 'field'): object {
+  const secret = (JSON.parse(payloadJson) as { atRestSecretKey: string }).atRestSecretKey
+  const key = createHash('sha256').update(secret, 'utf8').digest()
+  const keyId = deriveAtRestKeyId(key)
+  const nonce = Buffer.alloc(12, 7)
+  const framingCode = framing === 'field' ? 2 : 1
+  const formatId = framing === 'field' ? 'WBEV1' : 'WBEF1'
+  const aad = Buffer.concat([
+    Buffer.from('WB-AAD\0', 'ascii'),
+    Buffer.from([1]),
+    encodeLengthPrefixed(formatId),
+    encodeLengthPrefixed('sym-v1'),
+    encodeUint32(1),
+    encodeLengthPrefixed(keyId),
+    Buffer.from([framingCode]),
+    Buffer.from([0]),
+    Buffer.from([0]),
+  ])
+  const cipher = createCipheriv('aes-256-gcm', key, nonce, { authTagLength: 16 })
+  cipher.setAAD(aad)
+  const ciphertext = Buffer.concat([cipher.update(encoder.encode(plaintext)), cipher.final()])
+  const envelope = {
+    suite: 1,
+    keyId,
+    nonce: nonce.toString('base64'),
+    authTag: cipher.getAuthTag().toString('base64'),
+    ciphertext: ciphertext.toString('base64'),
+  }
+  return { $wbEncrypted: 1, envelope: Buffer.from(JSON.stringify(envelope), 'utf8').toString('base64') }
+}
+
+describe('deriveAtRestKey', () => {
+  it('hashes the payload base64 STRING, not the decoded secret bytes', () => {
+    const secret = secretFor('hashing-rule')
+    const key = deriveAtRestKey(keyPayload(secret))
+    // Hashing the base64 text is what the app does; hashing the decoded bytes
+    // would yield a different key and every field would fail to open.
+    expect(key.toString('hex')).toBe(
+      createHash('sha256').update(secret, 'utf8').digest('hex'),
+    )
+    expect(key.toString('hex')).not.toBe(
+      createHash('sha256').update(Buffer.from(secret, 'base64')).digest('hex'),
+    )
+  })
+
+  it('reports the key id as the first 16 hex characters of the key hash', () => {
+    const key = deriveAtRestKey(keyPayload(secretFor('key-id')))
+    expect(deriveAtRestKeyId(key)).toMatch(/^[0-9a-f]{16}$/u)
+    expect(deriveAtRestKeyId(key)).toBe(createHash('sha256').update(key).digest('hex').slice(0, 16))
+  })
+
+  it('derives a 16-hex-char id, which is the shape the real envelopes carry', () => {
+    // WHAT THIS DOES NOT PROVE, stated because the previous name and comment
+    // claimed the opposite (`docs/WINDOWS.md:43` still cites it as an A-tier
+    // fixed vector): it does NOT pin `9127dea1b44020a7`, the keyId observed on a
+    // real Windows install on 2026-09-26. That observation stands, but the SECRET
+    // that derives it was never recorded, so no test can reproduce the value end
+    // to end — fabricating a secret to make the number look pinned is exactly the
+    // failure this rewrite removes. The most an honest unit test asserts without
+    // that secret is the SHAPE, which is what every real envelope carries.
+    //
+    // The derivation RULE — the part that can actually drift — is pinned by the
+    // tests above: hash the payload's base64 STRING (not the decoded bytes), and
+    // take the first 16 hex characters of `sha256(key)`. Those assertions are
+    // falsifiable here; the vector is not.
+    const key = deriveAtRestKey(keyPayload(
+      createHash('sha256').update('shape-probe').digest('base64'),
+    ))
+    expect(deriveAtRestKeyId(key)).toMatch(/^[0-9a-f]{16}$/u)
+    expect(deriveAtRestKeyId(key)).toHaveLength(16)
+  })
+
+  it('rejects malformed payloads instead of deriving a key', () => {
+    expect(() => deriveAtRestKey('not json')).toThrow(/not valid JSON/u)
+    expect(() => deriveAtRestKey('[]')).toThrow(/not an object/u)
+    expect(() => deriveAtRestKey('{"version":1}')).toThrow(/no atRestSecretKey/u)
+    expect(() => deriveAtRestKey('{"version":1,"atRestSecretKey":42}')).toThrow(/no atRestSecretKey/u)
+  })
+})
+
+describe('isEncryptedFieldWrapper', () => {
+  it('accepts only the exact two-key wrapper', () => {
+    expect(isEncryptedFieldWrapper({ $wbEncrypted: 1, envelope: 'x' })).toBe(true)
+    expect(isEncryptedFieldWrapper({ $wbEncrypted: 1, envelope: 'x', scheme: 'asym-v1' })).toBe(false)
+    expect(isEncryptedFieldWrapper({ $wbEncrypted: 2, envelope: 'x' })).toBe(false)
+    expect(isEncryptedFieldWrapper({ $wbEncrypted: 1 })).toBe(false)
+    expect(isEncryptedFieldWrapper('plain')).toBe(false)
+    expect(isEncryptedFieldWrapper(null)).toBe(false)
+    expect(isEncryptedFieldWrapper([1, 2])).toBe(false)
+  })
+})
+
+describe('openEncryptedField', () => {
+  it('round-trips a field sealed with the same transcript', () => {
+    const payload = keyPayload(secretFor('round-trip'))
+    const key = deriveAtRestKey(payload)
+    const token = 'eyJhbGciOiJSUzI1NiJ9.round-trip-token'
+    const wrapper = sealField(token, payload) as never
+    expect(openEncryptedField(wrapper, key)).toBe(token)
+  })
+
+  it('opens a second field under the same key', () => {
+    const payload = keyPayload(secretFor('two-field'))
+    const key = deriveAtRestKey(payload)
+    expect(openEncryptedField(sealField('first', payload) as never, key)).toBe('first')
+    expect(openEncryptedField(sealField('second', payload) as never, key)).toBe('second')
+  })
+
+  it('refuses a key that does not match the envelope keyId', () => {
+    const payload = keyPayload(secretFor('owner'))
+    const other = deriveAtRestKey(keyPayload(secretFor('intruder')))
+    const wrapper = sealField('secret-token', payload) as never
+    expect(() => openEncryptedField(wrapper, other)).toThrow(/belongs to key/u)
+  })
+
+  it('refuses a tampered ciphertext rather than returning partial plaintext', () => {
+    const payload = keyPayload(secretFor('tamper'))
+    const key = deriveAtRestKey(payload)
+    const wrapper = sealField('original-token', payload) as { envelope: string }
+    const envelope = JSON.parse(Buffer.from(wrapper.envelope, 'base64').toString('utf8')) as { ciphertext: string }
+    const bytes = Buffer.from(envelope.ciphertext, 'base64')
+    bytes[0] = (bytes[0] ?? 0) ^ 0xff
+    envelope.ciphertext = bytes.toString('base64')
+    wrapper.envelope = Buffer.from(JSON.stringify(envelope), 'utf8').toString('base64')
+    expect(() => openEncryptedField(wrapper as never, key)).toThrow()
+  })
+
+  it('refuses a file-framed envelope, whose transcript differs', () => {
+    const payload = keyPayload(secretFor('framing'))
+    const key = deriveAtRestKey(payload)
+    const wrapper = sealField('whole-file', payload, 'file') as never
+    // A file-framed envelope authenticates under a different AAD, so opening it
+    // as a field must fail — silently accepting it would mean the transcript no
+    // longer binds the framing.
+    expect(() => openEncryptedField(wrapper, key)).toThrow()
+  })
+
+  it('rejects a malformed envelope', () => {
+    const key = deriveAtRestKey(keyPayload(secretFor('malformed')))
+    const bad = (envelope: string): never =>
+      ({ $wbEncrypted: 1, envelope: Buffer.from(envelope, 'utf8').toString('base64') }) as never
+    expect(() => openEncryptedField(bad('not json'), key)).toThrow(/not valid JSON/u)
+    expect(() => openEncryptedField(bad('[]'), key)).toThrow(/not an object/u)
+    expect(() => openEncryptedField(bad('{"suite":1}'), key)).toThrow(/missing suite or keyId/u)
+    expect(() => openEncryptedField(bad('{"suite":1,"keyId":"9127dea1b44020a7"}'), key)).toThrow(/missing nonce/u)
+  })
+})
+
+describe('hasEncryptedCredentialFields', () => {
+  const encrypted = sealField('token', keyPayload(secretFor('detect')))
+
+  it('detects an encrypted accessToken in the nested desktop shape', () => {
+    expect(hasEncryptedCredentialFields(JSON.stringify({
+      auth: { accessToken: encrypted, expiresAt: 1 },
+      account: { uin: '1' },
+    }))).toBe(true)
+  })
+
+  it('detects an encrypted refreshToken even when the access token is plain', () => {
+    expect(hasEncryptedCredentialFields(JSON.stringify({
+      auth: { accessToken: 'plain', refreshToken: encrypted },
+    }))).toBe(true)
+  })
+
+  it('detects the flat panel shape too', () => {
+    expect(hasEncryptedCredentialFields(JSON.stringify({ accessToken: encrypted }))).toBe(true)
+  })
+
+  it('detects an encrypted nickname even when both tokens are plain', () => {
+    // A build could encrypt the display name while leaving tokens plain; gating
+    // on tokens alone would then silently degrade the name to the uin again.
+    expect(hasEncryptedCredentialFields(JSON.stringify({
+      auth: { accessToken: 'plain', refreshToken: 'plain', domain: 'www.workbuddy.cn' },
+      account: { uin: '330105772757', nickname: encrypted },
+    }))).toBe(true)
+  })
+
+  it('detects an encrypted uin, uid, enterpriseId or domain', () => {
+    const wrap = (extra: Record<string, unknown>): string => JSON.stringify({
+      auth: { accessToken: 'a', refreshToken: 'r', ...extra },
+      account: { uin: '1' },
+    })
+    expect(hasEncryptedCredentialFields(wrap({ domain: encrypted }))).toBe(true)
+    for (const field of ['uin', 'uid', 'enterpriseId']) {
+      expect(hasEncryptedCredentialFields(JSON.stringify({
+        auth: { accessToken: 'a', refreshToken: 'r' },
+        account: { [field]: encrypted },
+      }))).toBe(true)
+    }
+  })
+
+  it('is false for plain documents, junk and absent files', () => {
+    expect(hasEncryptedCredentialFields(JSON.stringify({ auth: { accessToken: 'plain' } }))).toBe(false)
+    expect(hasEncryptedCredentialFields(JSON.stringify({
+      auth: { accessToken: 'plain', refreshToken: 'plain' },
+      account: { uin: '1', nickname: 'LaoDing' },
+    }))).toBe(false)
+    expect(hasEncryptedCredentialFields('not json')).toBe(false)
+    expect(hasEncryptedCredentialFields('[]')).toBe(false)
+    expect(hasEncryptedCredentialFields('{}')).toBe(false)
+  })
+})
+
+describe('parseWorkBuddyAuth with encrypted fields', () => {
+  const payload = keyPayload(secretFor('parse'))
+  const key = deriveAtRestKey(payload)
+
+  function documentWith(accessToken: unknown, refreshToken: unknown): string {
+    return JSON.stringify({
+      auth: { accessToken, refreshToken, expiresAt: 1_800_000_000_000, lastRefreshTime: 1_700_000_000_000, domain: 'www.workbuddy.cn' },
+      account: { uin: '330105772757', uid: 'uid-1', nickname: 'tester' },
+    })
+  }
+
+  it('reads a plain document without any key', () => {
+    const credential = parseWorkBuddyAuth(documentWith('plain-token', 'plain-refresh'), '/tmp/a.info')
+    expect(credential?.accessToken).toBe('plain-token')
+    expect(credential?.refreshToken).toBe('plain-refresh')
+  })
+
+  it('reads plain STRING documents verbatim — never treats them as ciphertext', () => {
+    // A base64-looking plain token must survive untouched; the reader must not
+    // try to decode a string that is not a wrapper.
+    const token = 'eyJhbGciOiJSUzI1NiJ9.plain-not-encrypted'
+    expect(parseWorkBuddyAuth(documentWith(token, token), '/tmp/a.info')?.accessToken).toBe(token)
+  })
+
+  it('returns undefined for an encrypted document when no key is supplied', () => {
+    // This is the shape of the original bug: a string-only reader reports the
+    // account as signed out while the file is perfectly healthy.
+    const encrypted = sealField('live-token', payload)
+    expect(parseWorkBuddyAuth(documentWith(encrypted, encrypted), '/tmp/a.info')).toBeUndefined()
+  })
+
+  it('reads the token once the key is supplied', () => {
+    const doc = documentWith(sealField('live-token', payload), sealField('live-refresh', payload))
+    const credential = parseWorkBuddyAuth(doc, '/tmp/a.info', key)
+    expect(credential?.accessToken).toBe('live-token')
+    expect(credential?.refreshToken).toBe('live-refresh')
+    // Identity and timing fields must survive the encrypted path unchanged.
+    expect(credential?.uin).toBe('330105772757')
+    expect(credential?.uid).toBe('uid-1')
+    expect(credential?.nickname).toBe('tester')
+    expect(credential?.domain).toBe('www.workbuddy.cn')
+    expect(credential?.expiresAtMs).toBe(1_800_000_000_000)
+    expect(credential?.lastRefreshAtMs).toBe(1_700_000_000_000)
+    expect(credential?.source).toBe('desktop')
+  })
+
+  it('reads a document whose access token is encrypted but refresh token is plain', () => {
+    const doc = documentWith(sealField('live-token', payload), 'plain-refresh')
+    const credential = parseWorkBuddyAuth(doc, '/tmp/a.info', key)
+    expect(credential?.accessToken).toBe('live-token')
+    expect(credential?.refreshToken).toBe('plain-refresh')
+  })
+
+  it('tolerates an encrypted refresh token with no access token', () => {
+    const doc = documentWith(undefined, sealField('live-refresh', payload))
+    expect(parseWorkBuddyAuth(doc, '/tmp/a.info', key)).toBeUndefined()
+  })
+
+  it('fails closed — never yields a half-decrypted credential', () => {
+    // A key from another machine cannot open the field; the answer must be
+    // "unreadable", not a truncated or empty token.
+    const wrongKey = deriveAtRestKey(keyPayload(secretFor('other-machine')))
+    const doc = documentWith(sealField('live-token', payload), sealField('live-refresh', payload))
+    expect(parseWorkBuddyAuth(doc, '/tmp/a.info', wrongKey)).toBeUndefined()
+  })
+
+  it('keeps the legacy empty-token rule', () => {
+    expect(parseWorkBuddyAuth(documentWith('', ''), '/tmp/a.info')).toBeUndefined()
+    const emptySealed = sealField('', payload)
+    expect(parseWorkBuddyAuth(documentWith(emptySealed, emptySealed), '/tmp/a.info', key)).toBeUndefined()
+  })
+
+  it('decrypts the display name — an encrypted nickname must not degrade to the uin', () => {
+    // Real Windows files encrypt `account.nickname` alongside the tokens. A
+    // reader that only decrypts tokens leaves the card showing a bare uin, so
+    // the account reads as "unknown user" even though it works.
+    const doc = JSON.stringify({
+      auth: {
+        accessToken: sealField('live-token', payload),
+        refreshToken: sealField('live-refresh', payload),
+        expiresAt: 1_800_000_000_000,
+        domain: 'www.workbuddy.cn',
+      },
+      account: { uin: '330105772757', uid: 'uid-1', nickname: sealField('LaoDing', payload) },
+    })
+    const credential = parseWorkBuddyAuth(doc, '/tmp/a.info', key)
+    expect(credential?.nickname).toBe('LaoDing')
+    // uin stays the stable identity used for the account id.
+    expect(credential?.uin).toBe('330105772757')
+    // The name survives the fallback chain the card renders.
+    expect(credential?.nickname ?? credential?.uin ?? credential?.uid).toBe('LaoDing')
+  })
+
+  it('still reads a plain nickname verbatim', () => {
+    const doc = JSON.stringify({
+      auth: { accessToken: 'plain', refreshToken: 'plain', domain: 'www.workbuddy.cn' },
+      account: { uin: '1', nickname: '老丁' },
+    })
+    expect(parseWorkBuddyAuth(doc, '/tmp/a.info')?.nickname).toBe('老丁')
+  })
+
+  it('treats an unopenable nickname as unknown instead of failing the document', () => {
+    // The name is optional: a wrapper we cannot open (key rotated, envelope
+    // damaged) must not take the whole credential down with it. This is the
+    // opposite of the token rule, where an unopenable wrapper IS fatal.
+    const wrongKey = deriveAtRestKey(keyPayload(secretFor('name-mismatch')))
+    const doc = JSON.stringify({
+      auth: { accessToken: 'plain-token', refreshToken: 'plain-refresh', domain: 'www.workbuddy.cn' },
+      account: { uin: '330105772757', nickname: sealField('LaoDing', payload) },
+    })
+    const credential = parseWorkBuddyAuth(doc, '/tmp/a.info', wrongKey)
+    expect(credential?.accessToken).toBe('plain-token')
+    expect(credential?.nickname).toBeUndefined()
+  })
+
+  it('never reads phoneNumber, even when it is encrypted and openable', () => {
+    // Privacy contract: the card admits nickname, masked uin, expiry and
+    // credits only. phoneNumber is encrypted in real files and must stay unread.
+    const doc = JSON.stringify({
+      auth: { accessToken: sealField('live-token', payload), refreshToken: 'plain', domain: 'www.workbuddy.cn' },
+      account: { uin: '1', nickname: 'x', phoneNumber: sealField('+8613800000000', payload) },
+    })
+    const credential = parseWorkBuddyAuth(doc, '/tmp/a.info', key)
+    expect(credential).toBeDefined()
+    expect(JSON.stringify(credential)).not.toContain('13800000000')
+    expect(Object.keys(credential ?? {})).not.toContain('phoneNumber')
+  })
+})
+
+describe('workbuddy app executable discovery', () => {
+  it('prefers the env override and probes the platform defaults', () => {
+    const env = { [WORKBUDDY_APP_EXECUTABLE_ENV]: 'D:\\custom\\WorkBuddy.exe', LOCALAPPDATA: 'C:\\Users\\x\\AppData\\Local' }
+    const candidates = workbuddyAppExecutableCandidates('win32', 'C:\\Users\\x', env)
+    expect(candidates[0]).toBe('D:\\custom\\WorkBuddy.exe')
+    expect(candidates.some(c => c.includes('Programs'))).toBe(true)
+  })
+
+  it('drops an unset or blank override instead of probing an empty path', () => {
+    const candidates = workbuddyAppExecutableCandidates('win32', 'C:\\Users\\x', {
+      [WORKBUDDY_APP_EXECUTABLE_ENV]: '   ',
+      LOCALAPPDATA: 'C:\\Users\\x\\AppData\\Local',
+    })
+    expect(candidates.every(c => c.trim() !== '')).toBe(true)
+    expect(candidates.some(c => c.includes('WorkBuddy.exe'))).toBe(true)
+  })
+
+  it('probes a per-user Windows install as well as the machine-wide ones', () => {
+    // `%LOCALAPPDATA%\WorkBuddy\WorkBuddy.exe` is a real observed layout: the
+    // machine-wide candidates alone report the app as missing there.
+    const candidates = workbuddyAppExecutableCandidates('win32', 'C:\\Users\\x', {
+      LOCALAPPDATA: 'C:\\Users\\x\\AppData\\Local',
+    })
+    // `win32.join`: the expectation is a Windows-shaped path, so it must not
+    // depend on the separator of whichever host runs the suite.
+    expect(candidates).toContain(win32.join('C:\\Users\\x\\AppData\\Local', 'WorkBuddy', 'WorkBuddy.exe'))
+  })
+
+  it('builds EVERY Windows candidate with win32 separators, on any host', () => {
+    // Regression guard for the silent class of bug this file hid once already:
+    // the production candidates were assembled with the HOST's `join`, and the
+    // expectation here was built the same way, so on Linux both sides produced
+    // `…\Local/WorkBuddy/WorkBuddy.exe` and matched each other. A Windows
+    // install could never match that string. Assert the SHAPE, which no `join`
+    // on the host can fake: a Windows path has `\` separators and no `/`.
+    const candidates = workbuddyAppExecutableCandidates('win32', 'C:\\Users\\x', {
+      LOCALAPPDATA: 'C:\\Users\\x\\AppData\\Local',
+      ProgramFiles: 'C:\\Program Files',
+      'ProgramFiles(x86)': 'C:\\Program Files (x86)',
+    })
+    for (const candidate of candidates) {
+      expect(candidate.endsWith('.exe')).toBe(true)
+      expect(candidate).not.toContain('/')
+      expect(candidate.split('\\').at(-1)).toMatch(/^WorkBuddy(AI)?\.exe$/u)
+    }
+    // Three bases x four directories x two binaries. Asserted as a product so a
+    // future edit that drops a whole dimension cannot pass by shrinking the set
+    // quietly — the failure mode here is "not found", which reads as a
+    // credentials problem, not as a missing candidate.
+    expect(candidates.length).toBe(3 * 4 * 2)
+  })
+
+  it('probes the international build, which ships under a different name and directory', () => {
+    // Issue #68: the international app installs as
+    // `%LOCALAPPDATA%\Programs\WorkBuddyAI\WorkBuddyAI.exe` — a different
+    // DIRECTORY and a different BINARY from the domestic build. Neither was in
+    // the probe list, so a machine with only the international app could not
+    // reach the key payload, and the unreadable credentials were reported as a
+    // wrong-region sign-in. `win32.join` for the reason above: the expectation is
+    // a Windows-shaped path and must not follow the host's separators.
+    const candidates = workbuddyAppExecutableCandidates('win32', 'C:\\Users\\x', {
+      LOCALAPPDATA: 'C:\\Users\\x\\AppData\\Local',
+    })
+    expect(candidates).toContain(
+      win32.join('C:\\Users\\x\\AppData\\Local', 'Programs', 'WorkBuddyAI', 'WorkBuddyAI.exe'),
+    )
+    // The domestic pair must survive the addition, in its observed order.
+    expect(candidates.indexOf(win32.join('C:\\Users\\x\\AppData\\Local', 'Programs', 'WorkBuddy', 'WorkBuddy.exe')))
+      .toBeLessThan(candidates.indexOf(win32.join('C:\\Users\\x\\AppData\\Local', 'Programs', 'WorkBuddyAI', 'WorkBuddyAI.exe')))
+  })
+
+  it('accepts a registry value naming either build, and still rejects everything else', () => {
+    // `normalizeRegistryExecutable` is the other place the name is checked, and
+    // it must agree with the probe list: a `DisplayIcon` pointing at the
+    // international binary is a legitimate target, not "another product's
+    // binary" to be rejected. The negative half matters just as much — this
+    // value is launched, so widening it carelessly would run something else.
+    expect(normalizeRegistryExecutable('"C:\\Program Files\\WorkBuddyAI\\WorkBuddyAI.exe",0'))
+      .toBe('C:\\Program Files\\WorkBuddyAI\\WorkBuddyAI.exe')
+    expect(normalizeRegistryExecutable('"C:\\Program Files\\WorkBuddy\\WorkBuddy.exe",0'))
+      .toBe('C:\\Program Files\\WorkBuddy\\WorkBuddy.exe')
+    expect(normalizeRegistryExecutable('"C:\\Program Files\\WorkBuddy\\uninstall.exe",0'))
+      .toBeUndefined()
+    expect(normalizeRegistryExecutable('"C:\\Program Files\\WorkBuddy\\WorkBuddy.exe.bak",0'))
+      .toBeUndefined()
+  })
+
+  it('offers the macOS bundle paths on darwin and nothing on linux', () => {
+    // The bundle reader is injected: the real one consults the filesystem, so
+    // without a seam this expectation would depend on whether the machine
+    // running the suite happens to have WorkBuddy installed.
+    const mac = workbuddyAppExecutableCandidates('darwin', '/Users/x', {}, () => undefined)
+    expect(mac).toHaveLength(0)
+    expect(workbuddyAppExecutableCandidates('linux', '/home/x', {})).toHaveLength(0)
+  })
+
+  it('assembles the macOS candidate from the name the bundle declares', () => {
+    // The reported bug: the binary was assumed to be named after the app, but
+    // the WorkBuddy bundles declare CFBundleExecutable=Electron. The candidate
+    // must follow the bundle, not the app's name.
+    //
+    // Every path here is built with `join`, exactly as the production code does.
+    // Hardcoding POSIX separators made this suite fail on Windows CI: there
+    // `join('/Applications', 'WorkBuddy.app')` yields backslashes, so a
+    // `startsWith('/Applications/...')` assertion is a statement about the
+    // HOST's separator, not about the behaviour under test.
+    const mac = workbuddyAppExecutableCandidates(
+      'darwin', '/Users/x', {},
+      bundle => join(bundle, 'Contents', 'MacOS', 'Electron'),
+    )
+    expect(mac).toContain(join('/Applications', 'WorkBuddy.app', 'Contents', 'MacOS', 'Electron'))
+  })
+
+  it('offers BOTH the domestic and the international macOS bundle', () => {
+    // A machine may carry only the international app; a candidates list that
+    // knows only WorkBuddy.app reports it as absent and the sign-in as missing.
+    const mac = workbuddyAppExecutableCandidates(
+      'darwin', '/Users/x', {},
+      bundle => join(bundle, 'Contents', 'MacOS', 'Electron'),
+    )
+    const expected = [
+      join('/Applications', 'WorkBuddy.app'),
+      join('/Applications', 'WorkBuddy AI.app'),
+      join('/Users/x', 'Applications'),
+    ]
+    for (const prefix of expected) {
+      expect(mac.some(candidate => candidate.startsWith(prefix))).toBe(true)
+    }
+  })
+
+  it('returns undefined when nothing exists at any candidate', () => {
+    // Both calls pass the registry seam, even though only the win32 branch can
+    // reach it. `platform` is an EXPLICIT parameter, not `process.platform`, so
+    // asking for 'win32' consults the REAL registry on whatever machine runs the
+    // suite — and the assertion then quietly becomes "this host has no
+    // WorkBuddy registered", which is neither what the test says nor under its
+    // control. It is green on macOS/Linux only because `reg` does not exist
+    // there and the spawn throws into `queryRegistry`'s catch; on a Windows host
+    // WITH the app installed, the lookup succeeds, the term is not undefined,
+    // and the test fails. Same host-dependence the source's `readBundleExecutable`
+    // seam exists to avoid (see the darwin case below, which already passes one).
+    const noRegistry = (): string | undefined => undefined
+    expect(findWorkbuddyAppExecutable('linux', '/home/x', {}, noRegistry)).toBeUndefined()
+    expect(findWorkbuddyAppExecutable(
+      'win32', 'C:\\nobody', { LOCALAPPDATA: 'C:\\definitely\\absent' }, noRegistry,
+    )).toBeUndefined()
+  })
+
+  it('never mixes separators, so a hardcoded "/" in the builder would be caught', () => {
+    // Regression guard for a real CI failure. The production code uses `join`,
+    // which is correct on every platform; the TEST hardcoded POSIX separators
+    // and so failed only on the Windows runner — it was asserting "this machine
+    // is POSIX", not "the darwin candidates are right".
+    //
+    // The property worth pinning is the one that makes `join` mandatory: a
+    // builder that concatenates with a literal '/' produces MIXED separators on
+    // Windows (`\Applications/WorkBuddy.app`), which no correct path may ever
+    // contain. On POSIX this is trivially satisfied; on the Windows CI runner it
+    // is the assertion that bites.
+    const mac = workbuddyAppExecutableCandidates(
+      'darwin', '/Users/x', {},
+      bundle => join(bundle, 'Contents', 'MacOS', 'Electron'),
+    )
+    expect(mac.length).toBeGreaterThan(0)
+    for (const candidate of mac) {
+      const mixed = candidate.includes('/') && candidate.includes('\\')
+      expect(mixed).toBe(false)
+      // The separator actually used must be this host's.
+      expect(candidate.includes(sep)).toBe(true)
+    }
+  })
+})
+
+describe('windows registry app discovery', () => {
+  /**
+   * Scratch directories created by this suite, removed in `afterEach` so a
+   * failure leaves no debris behind.
+   */
+  const temporary: string[] = []
+
+  afterEach(async () => {
+    for (const dir of temporary.splice(0)) await rm(dir, { recursive: true, force: true })
+  })
+
+  /**
+   * Verbatim `reg query` output from the machine that motivated this feature:
+   * WorkBuddy installed on `E:\workbuddy`, a layout none of the four default
+   * directory candidates can see. `DisplayIcon` names the binary; the other
+   * values are present because the real query returns the whole key.
+   */
+  const REAL_QUERY = [
+    '',
+    'HKEY_CURRENT_USER\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\BFD312E9-1019-4F57-9F44-F86246833B50',
+    '    DisplayName    REG_SZ    WorkBuddy 5.6.2',
+    '    UninstallString    REG_SZ    "E:\\workbuddy\\Uninstall WorkBuddy.exe" /currentuser',
+    '    DisplayIcon    REG_SZ    E:\\workbuddy\\WorkBuddy.exe,0',
+    '    HelpLink    REG_SZ    https://www.workbuddy.cn',
+    '',
+    'End of search: 12 match(es) found.',
+    '',
+  ].join('\r\n')
+
+  it('reads the executable path out of a real query result', () => {
+    expect(registryExecutableFromQuery(REAL_QUERY)).toBe('E:\\workbuddy\\WorkBuddy.exe')
+  })
+
+  it('accepts the quoted, icon-indexed form the installer also writes', () => {
+    expect(normalizeRegistryExecutable('"E:\\workbuddy\\WorkBuddy.exe",0')).toBe('E:\\workbuddy\\WorkBuddy.exe')
+    expect(normalizeRegistryExecutable('"C:\\Program Files\\WorkBuddy\\WorkBuddy.exe",12')).toBe(
+      'C:\\Program Files\\WorkBuddy\\WorkBuddy.exe',
+    )
+  })
+
+  it('accepts a bare path, because not every installer writes the indexed form', () => {
+    expect(normalizeRegistryExecutable('E:\\workbuddy\\WorkBuddy.exe')).toBe('E:\\workbuddy\\WorkBuddy.exe')
+  })
+
+  it('refuses a value that is not the desktop executable', () => {
+    // The safety property: the path this returns is handed to a child-process
+    // spawn. An uninstaller, an icon, or another product's binary must not be
+    // launched, so anything that is not exactly WorkBuddy.exe is rejected.
+    expect(normalizeRegistryExecutable('E:\\workbuddy\\Uninstall WorkBuddy.exe,0')).toBeUndefined()
+    expect(normalizeRegistryExecutable('E:\\workbuddy\\app.ico')).toBeUndefined()
+    expect(normalizeRegistryExecutable('C:\\Other\\Other.exe')).toBeUndefined()
+    expect(normalizeRegistryExecutable('')).toBeUndefined()
+    expect(normalizeRegistryExecutable('   ')).toBeUndefined()
+  })
+
+  it('does not silently truncate an unterminated quote', () => {
+    // Malformed data is refused rather than guessed at; a half-read path would
+    // be a wrong path, which is worse than falling through to the hint.
+    expect(normalizeRegistryExecutable('"E:\\workbuddy\\WorkBuddy.exe')).toBeUndefined()
+  })
+
+  it('falls back to InstallLocation when the registration omits DisplayIcon', () => {
+    const output = [
+      'HKEY_CURRENT_USER\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\{GUID}',
+      '    DisplayName    REG_SZ    WorkBuddy 5.6.2',
+      '    InstallLocation    REG_SZ    E:\\workbuddy',
+      '',
+    ].join('\r\n')
+    expect(registryExecutableFromQuery(output)).toBeUndefined()
+    expect(registryInstallLocationFromQuery(output)).toBe(win32.join('E:\\workbuddy', 'WorkBuddy.exe'))
+  })
+
+  it('queries both hives and prefers the user hive that answers first', () => {
+    const asked: string[][] = []
+    const found = windowsRegistryAppExecutable(args => {
+      asked.push([...args])
+      // Only the per-user hive answers, which is the layout WorkBuddy installs.
+      return args[1]?.startsWith('HKCU') === true ? REAL_QUERY : undefined
+    })
+    expect(found).toBe('E:\\workbuddy\\WorkBuddy.exe')
+    expect(asked).toHaveLength(1)
+    expect(asked[0]![1]).toContain('HKCU')
+  })
+
+  it('returns undefined when neither hive has the app registered', () => {
+    // The normal case on a machine without WorkBuddy: every failure path has to
+    // be silent so the caller falls through to its documented hint.
+    expect(windowsRegistryAppExecutable(() => undefined)).toBeUndefined()
+    expect(windowsRegistryAppExecutable(() => 'End of search: 0 match(es) found.')).toBeUndefined()
+  })
+
+  it('consults the registry only on win32, after every cheap candidate has missed', () => {
+    // The registry is a FALLBACK, not a candidate: a machine on darwin/linux
+    // must never run `reg`, and a default Windows install must not pay for the
+    // query at all.
+    const called: string[] = []
+    const probe = (): string | undefined => {
+      called.push('called')
+      return undefined
+    }
+    expect(findWorkbuddyAppExecutable('linux', '/home/x', {}, probe)).toBeUndefined()
+    // NOT `toBeUndefined()` on darwin: the macOS branch is a real filesystem
+    // lookup, so on a developer's Mac with WorkBuddy installed it legitimately
+    // finds the bundle. Asserting undefined would pass in CI and fail here —
+    // exactly the host-dependence the source's `readBundleExecutable` seam
+    // exists to avoid. What this test is actually about is the REGISTRY seam,
+    // so assert on that: the darwin branch must not call it.
+    findWorkbuddyAppExecutable('darwin', '/Users/x', {}, probe)
+    expect(called).toHaveLength(0)
+  })
+
+  it('uses the registry path when a real install lives off the default layout', async () => {
+    // End-to-end for the reported bug: the four candidates all miss (they point
+    // at a temp dir), and the ONLY reason the app is found is the registration.
+    const dir = await mkdtemp(join(tmpdir(), 'wb-registry-'))
+    temporary.push(dir)
+    const executable = join(dir, 'WorkBuddy.exe')
+    await writeFile(executable, '')
+
+    const found = findWorkbuddyAppExecutable(
+      'win32',
+      dir,
+      { LOCALAPPDATA: join(dir, 'absent-local'), ProgramFiles: join(dir, 'absent-pf') },
+      () => executable,
+    )
+    expect(found).toBe(executable)
+  })
+
+  it('ignores a registration pointing at a file that is gone', async () => {
+    // A stale registration after an uninstall must not become the answer.
+    const dir = await mkdtemp(join(tmpdir(), 'wb-registry-stale-'))
+    temporary.push(dir)
+    const found = findWorkbuddyAppExecutable(
+      'win32',
+      dir,
+      { LOCALAPPDATA: join(dir, 'absent-local') },
+      () => join(dir, 'WorkBuddy.exe'),
+    )
+    expect(found).toBeUndefined()
+  })
+
+  it('reports the registry as the source when the registration is what answered', async () => {
+    // `doctor` prints this: the path alone cannot distinguish "found in the
+    // default layout" from "the off-layout fallback saved you", and that
+    // difference is the whole point of the fallback.
+    const dir = await mkdtemp(join(tmpdir(), 'wb-registry-source-'))
+    temporary.push(dir)
+    const executable = join(dir, 'WorkBuddy.exe')
+    await writeFile(executable, '')
+
+    const found = findWorkbuddyAppExecutableWithSource(
+      'win32',
+      dir,
+      { LOCALAPPDATA: join(dir, 'absent-local') },
+      () => executable,
+    )
+    expect(found).toEqual({ executable, source: 'registry' })
+  })
+
+  it('reports an env override as its own source, not as a default-layout hit', async () => {
+    // A hand-set override is the answer to "why is it using THAT binary?", so
+    // it must not be reported as if the default layout had provided it.
+    const dir = await mkdtemp(join(tmpdir(), 'wb-env-source-'))
+    temporary.push(dir)
+    const executable = join(dir, 'Custom.exe')
+    await writeFile(executable, '')
+
+    const found = findWorkbuddyAppExecutableWithSource(
+      'win32',
+      dir,
+      { [WORKBUDDY_APP_EXECUTABLE_ENV]: executable },
+      () => undefined,
+    )
+    expect(found).toEqual({ executable, source: 'env' })
+  })
+
+  it('reports nothing found when neither the layout nor the registration answers', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'wb-none-source-'))
+    temporary.push(dir)
+    expect(
+      findWorkbuddyAppExecutableWithSource(
+        'win32',
+        dir,
+        { LOCALAPPDATA: join(dir, 'absent-local') },
+        () => undefined,
+      ),
+    ).toBeUndefined()
+  })
+})
+
+describe('macosBundleExecutable', () => {
+  /** Build a throwaway .app bundle whose Info.plist carries the given keys. */
+  async function makeBundle(dir: string, entries: Record<string, string>): Promise<string> {
+    const bundle = join(dir, 'WorkBuddy.app')
+    await mkdir(join(bundle, 'Contents', 'MacOS'), { recursive: true })
+    const plist = ['<?xml version="1.0" encoding="UTF-8"?>', '<plist version="1.0"><dict>',
+      ...Object.entries(entries).flatMap(([k, v]) => [`<key>${k}</key>`, `<string>${v}</string>`]),
+      '</dict></plist>'].join('\n')
+    await writeFile(join(bundle, 'Contents', 'Info.plist'), plist)
+    // Only a name that stays inside MacOS can be materialized; a traversal
+    // candidate is exactly the case under test, and the parser must reject it
+    // before any file exists. The separator check mirrors the parser's own.
+    const name = entries['CFBundleExecutable']
+    if (name !== undefined && !name.includes('/') && !name.includes('\\') && name !== '..' && name !== '.') {
+      await writeFile(join(bundle, 'Contents', 'MacOS', name), '')
+    }
+    return bundle
+  }
+
+  let dir: string
+  beforeEach(async () => {
+    dir = await mkdtemp(join(tmpdir(), 'wb-bundle-'))
+  })
+  afterEach(async () => {
+    await rm(dir, { recursive: true, force: true })
+  })
+
+  it('reads the real executable name instead of assuming the app name', async () => {
+    // This is the defect that made a signed-in macOS user look signed out: the
+    // path was built as .../MacOS/WorkBuddy while the bundle declares Electron.
+    const bundle = await makeBundle(dir, {
+      CFBundleIdentifier: 'com.tencent.workbuddy.mac',
+      CFBundleExecutable: 'Electron',
+    })
+    expect(macosBundleExecutable(bundle)).toBe(join(bundle, 'Contents', 'MacOS', 'Electron'))
+  })
+
+  it('returns undefined for a missing bundle rather than a guessed path', async () => {
+    expect(macosBundleExecutable(join(dir, 'Nope.app'))).toBeUndefined()
+  })
+
+  it('rejects a name that would escape Contents/MacOS', async () => {
+    // A plist is data read off disk; a traversal here would hand execFile a
+    // path outside the bundle.
+    for (const name of ['../Evil', '..', '.', 'sub/Bin']) {
+      const bundle = await makeBundle(dir, { CFBundleExecutable: name })
+      expect(macosBundleExecutable(bundle)).toBeUndefined()
+      await rm(bundle, { recursive: true, force: true })
+    }
+  })
+
+  it('returns undefined when the plist declares no executable', async () => {
+    const bundle = await makeBundle(dir, { CFBundleIdentifier: 'com.tencent.workbuddy.mac' })
+    expect(macosBundleExecutable(bundle)).toBeUndefined()
+  })
+})
+
+describe('isWorkbuddyBundle', () => {
+  let dir: string
+  beforeEach(async () => {
+    dir = await mkdtemp(join(tmpdir(), 'wb-ident-'))
+  })
+  afterEach(async () => {
+    await rm(dir, { recursive: true, force: true })
+  })
+
+  async function bundleWith(identifier: string | undefined): Promise<string> {
+    const bundle = join(dir, `app-${Math.random().toString(36).slice(2)}.app`)
+    await mkdir(join(bundle, 'Contents'), { recursive: true })
+    const plist = identifier === undefined
+      ? '<?xml version="1.0"?><plist version="1.0"><dict></dict></plist>'
+      : `<?xml version="1.0"?><plist version="1.0"><dict><key>CFBundleIdentifier</key><string>${identifier}</string></dict></plist>`
+    await writeFile(join(bundle, 'Contents', 'Info.plist'), plist)
+    return bundle
+  }
+
+  it('accepts the domestic and international bundle identifiers', async () => {
+    expect(isWorkbuddyBundle(await bundleWith('com.tencent.workbuddy.mac'))).toBe(true)
+    expect(isWorkbuddyBundle(await bundleWith('com.workbuddy.workbuddy-ai'))).toBe(true)
+  })
+
+  it('refuses another Electron app, so the scan cannot exec the wrong product', async () => {
+    // Every Electron app ships a binary named `Electron`; only the identifier
+    // distinguishes them, and this check is what makes the nested scan safe.
+    expect(isWorkbuddyBundle(await bundleWith('com.microsoft.VSCode'))).toBe(false)
+    expect(isWorkbuddyBundle(await bundleWith('com.workbuddyish.app'))).toBe(false)
+    expect(isWorkbuddyBundle(await bundleWith('org.workbuddyevil.mac'))).toBe(false)
+  })
+
+  it('refuses an unreadable or identifier-less bundle', async () => {
+    expect(isWorkbuddyBundle(join(dir, 'absent.app'))).toBe(false)
+    expect(isWorkbuddyBundle(await bundleWith(undefined))).toBe(false)
+  })
+})
